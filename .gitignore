@@ -1,0 +1,35 @@
+# ==========================================
+# Privacy & Sensitive Runtime Data (NEVER COMMIT)
+# ==========================================
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+reports/
+TimeReports/
+*.log
+
+# ==========================================
+# Python artifacts
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+
+# ==========================================
+# System & Editor configs
+# ==========================================
+.DS_Store
+Thumbs.db
+.env
+.env.*
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

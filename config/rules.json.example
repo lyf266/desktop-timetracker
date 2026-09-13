@@ -1,0 +1,81 @@
+{
+  "categories": [
+    {
+      "name": "编程开发",
+      "icon": "💻",
+      "apps": [
+        "orca", "code", "vscodium", "cursor", "nvim", "vim", "emacs",
+        "kate", "sublime_text", "idea", "pycharm", "clion", "rustrover",
+        "webstorm", "goland", "rider", "eclipse", "zed"
+      ],
+      "title_keywords": [
+        ".py", ".rs", ".js", ".ts", ".go", ".c", ".cpp", ".java",
+        ".sh", ".html", ".css", "Visual Studio Code", "Orca", "NeoVim", "Vim"
+      ]
+    },
+    {
+      "name": "终端运维",
+      "icon": "📟",
+      "apps": [
+        "konsole", "kitty", "alacritty", "wezterm", "foot",
+        "xterm", "gnome-terminal", "terminator", "urxvt"
+      ],
+      "title_keywords": []
+    },
+    {
+      "name": "网页浏览",
+      "icon": "🌐",
+      "apps": [
+        "google-chrome", "chromium", "firefox", "zen-browser",
+        "brave-browser", "microsoft-edge", "vivaldi", "opera", "tor-browser"
+      ],
+      "title_keywords": []
+    },
+    {
+      "name": "即时通讯",
+      "icon": "💬",
+      "apps": [
+        "telegram", "telegram-desktop", "wechat", "qq", "discord", "slack",
+        "element", "thunderbird", "feishu", "dingtalk", "teams"
+      ],
+      "title_keywords": ["Telegram", "微信", "Discord", "Slack", "QQ"]
+    },
+    {
+      "name": "文档笔记",
+      "icon": "📝",
+      "apps": [
+        "obsidian", "notion", "logseq", "libreoffice", "wps",
+        "typora", "marktext", "evince", "okular", "calibre", "zotero"
+      ],
+      "title_keywords": ["Obsidian", "Notion", "WPS", "PDF", "LibreOffice", "Typora"]
+    },
+    {
+      "name": "媒体娱乐",
+      "icon": "🎬",
+      "apps": [
+        "bilibili", "mpv", "vlc", "spotify", "netease-cloud-music",
+        "steam", "gamescope", "lutris", "heroic"
+      ],
+      "title_keywords": ["Bilibili", "YouTube", "哔哩哔哩", "Spotify", "Steam"]
+    },
+    {
+      "name": "图形设计",
+      "icon": "🎨",
+      "apps": [
+        "gimp", "inkscape", "blender", "krita", "figma"
+      ],
+      "title_keywords": ["Blender", "GIMP", "Krita", "Figma"]
+    },
+    {
+      "name": "系统桌面",
+      "icon": "⚙️",
+      "apps": [
+        "plasmashell", "krunner", "systemsettings", "dolphin", "ark", "kio"
+      ],
+      "title_keywords": ["Desktop", "系统设置", "Dolphin"]
+    }
+  ],
+  "default_category": "其他应用",
+  "soft_idle_threshold_seconds": 900,
+  "sample_interval_seconds": 5
+}

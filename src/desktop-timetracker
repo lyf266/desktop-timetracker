@@ -1,0 +1,835 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Desktop TimeTracker for KDE Plasma 6 Wayland
+Zero-dependency, privacy-first, automated desktop activity and time tracking.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# --- Paths & Constants ---
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "timetracker"
+DATA_DIR = HOME / ".local" / "share" / "timetracker"
+BIN_DIR = HOME / ".local" / "bin"
+REPORTS_DIR = HOME / "Documents" / "TimeReports"
+SYSTEMD_USER_DIR = HOME / ".config" / "systemd" / "user"
+
+CONFIG_FILE = CONFIG_DIR / "rules.json"
+DB_FILE = DATA_DIR / "timetracker.db"
+KWIN_SCRIPT_FILE = DATA_DIR / "timetracker_kwin.js"
+SERVICE_FILE = SYSTEMD_USER_DIR / "desktop-timetracker.service"
+
+APP_NAME_MAP = {
+    "firefox": "Firefox",
+    "google-chrome": "Google Chrome",
+    "chromium": "Chromium",
+    "zen-browser": "Zen Browser",
+    "brave-browser": "Brave Browser",
+    "microsoft-edge": "Microsoft Edge",
+    "orca": "Orca IDE",
+    "code": "VS Code",
+    "vscodium": "VSCodium",
+    "cursor": "Cursor",
+    "konsole": "Konsole",
+    "kitty": "Kitty",
+    "alacritty": "Alacritty",
+    "wezterm": "WezTerm",
+    "foot": "Foot Terminal",
+    "obsidian": "Obsidian",
+    "notion": "Notion",
+    "logseq": "Logseq",
+    "libreoffice": "LibreOffice",
+    "telegram-desktop": "Telegram",
+    "telegram": "Telegram",
+    "wechat": "微信",
+    "qq": "QQ",
+    "discord": "Discord",
+    "slack": "Slack",
+    "steam": "Steam",
+    "vlc": "VLC Media Player",
+    "mpv": "MPV",
+    "spotify": "Spotify",
+    "netease-cloud-music": "网易云音乐",
+    "bilibili": "哔哩哔哩",
+    "plasmashell": "KDE 系统桌面",
+    "screensaver": "锁屏/休眠",
+    "systemsettings": "系统设置",
+    "dolphin": "Dolphin 文件管理器",
+}
+
+DEFAULT_RULES = {
+    "categories": [
+        {
+            "name": "编程开发",
+            "icon": "💻",
+            "apps": [
+                "orca", "code", "vscodium", "cursor", "nvim", "vim", "emacs",
+                "kate", "sublime_text", "idea", "pycharm", "clion", "rustrover",
+                "webstorm", "goland", "rider", "eclipse", "zed"
+            ],
+            "title_keywords": [
+                ".py", ".rs", ".js", ".ts", ".go", ".c", ".cpp", ".java",
+                ".sh", ".html", ".css", "Visual Studio Code", "Orca", "NeoVim", "Vim"
+            ]
+        },
+        {
+            "name": "终端运维",
+            "icon": "📟",
+            "apps": [
+                "konsole", "kitty", "alacritty", "wezterm", "foot",
+                "xterm", "gnome-terminal", "terminator", "urxvt"
+            ],
+            "title_keywords": []
+        },
+        {
+            "name": "网页浏览",
+            "icon": "🌐",
+            "apps": [
+                "google-chrome", "chromium", "firefox", "zen-browser",
+                "brave-browser", "microsoft-edge", "vivaldi", "opera", "tor-browser"
+            ],
+            "title_keywords": []
+        },
+        {
+            "name": "即时通讯",
+            "icon": "💬",
+            "apps": [
+                "telegram", "telegram-desktop", "wechat", "qq", "discord", "slack",
+                "element", "thunderbird", "feishu", "dingtalk", "teams"
+            ],
+            "title_keywords": ["Telegram", "微信", "Discord", "Slack", "QQ"]
+        },
+        {
+            "name": "文档笔记",
+            "icon": "📝",
+            "apps": [
+                "obsidian", "notion", "logseq", "libreoffice", "wps",
+                "typora", "marktext", "evince", "okular", "calibre", "zotero"
+            ],
+            "title_keywords": ["Obsidian", "Notion", "WPS", "PDF", "LibreOffice", "Typora"]
+        },
+        {
+            "name": "媒体娱乐",
+            "icon": "🎬",
+            "apps": [
+                "bilibili", "mpv", "vlc", "spotify", "netease-cloud-music",
+                "steam", "gamescope", "lutris", "heroic"
+            ],
+            "title_keywords": ["Bilibili", "YouTube", "哔哩哔哩", "Spotify", "Steam"]
+        },
+        {
+            "name": "图形设计",
+            "icon": "🎨",
+            "apps": [
+                "gimp", "inkscape", "blender", "krita", "figma"
+            ],
+            "title_keywords": ["Blender", "GIMP", "Krita", "Figma"]
+        },
+        {
+            "name": "系统桌面",
+            "icon": "⚙️",
+            "apps": [
+                "plasmashell", "krunner", "systemsettings", "dolphin", "ark", "kio"
+            ],
+            "title_keywords": ["Desktop", "系统设置", "Dolphin"]
+        }
+    ],
+    "default_category": "其他应用",
+    "soft_idle_threshold_seconds": 900,
+    "sample_interval_seconds": 5
+}
+
+
+def ensure_dirs():
+    for d in [CONFIG_DIR, DATA_DIR, BIN_DIR, REPORTS_DIR, SYSTEMD_USER_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def load_rules():
+    if not CONFIG_FILE.exists():
+        ensure_dirs()
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_RULES, f, ensure_ascii=False, indent=2)
+        return DEFAULT_RULES
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return DEFAULT_RULES
+
+
+class Database:
+    def __init__(self, db_path=DB_FILE):
+        self.db_path = db_path
+        self._init_db()
+
+    def get_conn(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        return conn
+
+    def _init_db(self):
+        ensure_dirs()
+        with self.get_conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS window_activities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL,
+                    duration_seconds INTEGER NOT NULL,
+                    app_id TEXT NOT NULL,
+                    app_name TEXT NOT NULL,
+                    window_title TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    is_locked INTEGER DEFAULT 0,
+                    is_idle INTEGER DEFAULT 0
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_time ON window_activities(start_time, end_time);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_category ON window_activities(category);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_app ON window_activities(app_id);")
+
+    def save_record(self, start_time, end_time, duration, app_id, app_name, window_title, category, is_locked, is_idle, record_id=None):
+        if duration <= 0:
+            return None
+        with self.get_conn() as conn:
+            if record_id:
+                conn.execute("""
+                    UPDATE window_activities
+                    SET end_time = ?, duration_seconds = ?, is_idle = ?
+                    WHERE id = ?
+                """, (end_time, duration, is_idle, record_id))
+                return record_id
+            else:
+                cur = conn.execute("""
+                    INSERT INTO window_activities (
+                        start_time, end_time, duration_seconds,
+                        app_id, app_name, window_title, category,
+                        is_locked, is_idle
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (start_time, end_time, duration, app_id, app_name, window_title, category, is_locked, is_idle))
+                return cur.lastrowid
+
+    def query_day(self, target_date):
+        """Query activities for a specific YYYY-MM-DD date."""
+        with self.get_conn() as conn:
+            cur = conn.execute("""
+                SELECT * FROM window_activities
+                WHERE date(start_time) = date(?)
+                ORDER BY start_time ASC
+            """, (target_date,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def query_date_range(self, start_date, end_date):
+        with self.get_conn() as conn:
+            cur = conn.execute("""
+                SELECT * FROM window_activities
+                WHERE date(start_time) >= date(?) AND date(start_time) <= date(?)
+                ORDER BY start_time ASC
+            """, (start_date, end_date))
+            return [dict(r) for r in cur.fetchall()]
+
+
+class Classifier:
+    def __init__(self, rules):
+        self.rules = rules
+
+    def classify(self, app_id, window_title, is_locked):
+        if is_locked:
+            return "锁屏/休眠", "🔒", "锁屏/休眠"
+
+        app_id_clean = (app_id or "").lower().strip()
+        title_clean = window_title or ""
+
+        friendly_name = APP_NAME_MAP.get(app_id_clean)
+        if not friendly_name:
+            if app_id_clean:
+                friendly_name = app_id_clean.replace("-", " ").title()
+            else:
+                friendly_name = "未知应用"
+
+        for cat in self.rules.get("categories", []):
+            cat_name = cat.get("name", "其他")
+            icon = cat.get("icon", "📌")
+
+            # Check app match
+            for a in cat.get("apps", []):
+                if a and a.lower() in app_id_clean:
+                    return cat_name, icon, friendly_name
+
+            # Check title keywords
+            for kw in cat.get("title_keywords", []):
+                if kw and kw.lower() in title_clean.lower():
+                    return cat_name, icon, friendly_name
+
+        default_cat = self.rules.get("default_category", "其他应用")
+        return default_cat, "📌", friendly_name
+
+
+def format_duration(seconds):
+    if seconds < 0:
+        seconds = 0
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h}小时{m:02d}分"
+    elif m > 0:
+        return f"{m}分钟{s:02d}秒"
+    else:
+        return f"{s}秒"
+
+
+def format_duration_short(seconds):
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    if h > 0:
+        return f"{h}h {m:02d}m"
+    elif m > 0:
+        return f"{m}m"
+    else:
+        return f"{seconds}s"
+
+
+def make_bar(ratio, width=20):
+    full_blocks = int(ratio * width)
+    remainder = (ratio * width) - full_blocks
+    chars = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
+    sub_char = chars[int(remainder * 8)] if remainder > 0 else ""
+    bar = "█" * full_blocks + sub_char
+    return bar.ljust(width, "░")
+
+
+class ReportGenerator:
+    @staticmethod
+    def generate_markdown(records, target_date):
+        if not records:
+            return f"# 桌面使用时间日报 ({target_date})\n\n该日期无活动记录。\n"
+
+        total_active_secs = 0
+        total_locked_secs = 0
+        cat_times = {}
+        app_times = {}
+        window_times = {}
+        hourly_active = {h: 0 for h in range(24)}
+
+        for r in records:
+            dur = r["duration_seconds"]
+            is_locked = r["is_locked"]
+            cat = r["category"]
+            app = r["app_name"]
+            title = r["window_title"].strip() or "无标题窗口"
+
+            if is_locked:
+                total_locked_secs += dur
+            else:
+                total_active_secs += dur
+                cat_times[cat] = cat_times.get(cat, 0) + dur
+                app_times[app] = app_times.get(app, 0) + dur
+                window_times[(app, title)] = window_times.get((app, title), 0) + dur
+
+                try:
+                    start_dt = datetime.datetime.fromisoformat(r["start_time"])
+                    hourly_active[start_dt.hour] += dur
+                except Exception:
+                    pass
+
+        grand_total = total_active_secs + total_locked_secs
+
+        # Top Categories
+        sorted_cats = sorted(cat_times.items(), key=lambda x: x[1], reverse=True)
+        sorted_apps = sorted(app_times.items(), key=lambda x: x[1], reverse=True)[:10]
+        sorted_windows = sorted(window_times.items(), key=lambda x: x[1], reverse=True)[:10]
+
+        md = []
+        md.append(f"# 📊 桌面使用时间日报 ({target_date})")
+        md.append(f"\n> 自动生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+        # Summary KPIs
+        md.append("## 1. 核心概览\n")
+        md.append(f"- **总开机时长**: `{format_duration(grand_total)}`")
+        md.append(f"- **有效专注时长**: `{format_duration(total_active_secs)}` ({((total_active_secs/grand_total*100) if grand_total else 0):.1f}%)")
+        md.append(f"- **锁屏/离开时长**: `{format_duration(total_locked_secs)}` ({((total_locked_secs/grand_total*100) if grand_total else 0):.1f}%)")
+
+        # Category Breakdown Table
+        md.append("\n## 2. 类别时间分布\n")
+        md.append("| 分类 | 累计时长 | 占比 | 进度条 |")
+        md.append("| :--- | :--- | :--- | :--- |")
+        for cat, secs in sorted_cats:
+            ratio = (secs / total_active_secs) if total_active_secs > 0 else 0
+            bar = make_bar(ratio, width=15)
+            md.append(f"| **{cat}** | `{format_duration(secs)}` | `{ratio*100:.1f}%` | `{bar}` |")
+
+        # Top Apps Table
+        md.append("\n## 3. 最常使用的应用 Top 10\n")
+        md.append("| 排名 | 应用程序 | 累计时长 | 占有效时间比 |")
+        md.append("| :---: | :--- | :--- | :--- |")
+        for idx, (app, secs) in enumerate(sorted_apps, 1):
+            ratio = (secs / total_active_secs) if total_active_secs > 0 else 0
+            md.append(f"| {idx} | **{app}** | `{format_duration(secs)}` | `{ratio*100:.1f}%` |")
+
+        # Top Window Captions Table
+        md.append("\n## 4. 关键窗口与任务详情 Top 10\n")
+        md.append("| 排名 | 对应应用 | 窗口标题明细 | 持续时间 |")
+        md.append("| :---: | :--- | :--- | :--- |")
+        for idx, ((app, title), secs) in enumerate(sorted_windows, 1):
+            clean_title = title.replace("|", "-")
+            if len(clean_title) > 60:
+                clean_title = clean_title[:57] + "..."
+            md.append(f"| {idx} | {app} | `{clean_title}` | `{format_duration(secs)}` |")
+
+        # Hourly Activity Chart
+        md.append("\n## 5. 全天活跃时段分布 (小时)\n")
+        md.append("| 时段 | 活跃时间 | 活跃度可视化 |")
+        md.append("| :---: | :--- | :--- |")
+        for h in range(24):
+            secs = hourly_active[h]
+            if secs > 0:
+                ratio = min(secs / 3600.0, 1.0)
+                bar = make_bar(ratio, width=12)
+                md.append(f"| `{h:02d}:00 - {h+1:02d}:00` | `{format_duration_short(secs)}` | `{bar}` |")
+
+        md.append("\n---\n*由 Desktop TimeTracker 自动记录生成*\n")
+        return "\n".join(md)
+
+
+class Daemon:
+    def __init__(self):
+        self.rules = load_rules()
+        self.classifier = Classifier(self.rules)
+        self.db = Database()
+        self.running = True
+        self.current_chunk = None  # dict representing active continuous chunk
+        self.last_flush_time = time.time()
+        self.kwin_script_id = None
+        self.journal_proc = None
+
+    def get_lock_status(self):
+        try:
+            res = subprocess.run(
+                ["qdbus6", "org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver.GetActive"],
+                capture_output=True, text=True, timeout=1.5
+            )
+            return res.stdout.strip() == "true"
+        except Exception:
+            return False
+
+    def load_kwin_script(self):
+        # Unload existing first
+        subprocess.run(["qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "timetracker_kwin"], capture_output=True)
+        res = subprocess.run(
+            ["qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript", str(KWIN_SCRIPT_FILE), "timetracker_kwin"],
+            capture_output=True, text=True
+        )
+        script_id = res.stdout.strip()
+        if script_id and script_id.isdigit() and int(script_id) >= 0:
+            self.kwin_script_id = int(script_id)
+            subprocess.run(["qdbus6", "org.kde.KWin", f"/Scripting/Script{self.kwin_script_id}", "org.kde.kwin.Script.run"], capture_output=True)
+            print(f"[{datetime.datetime.now()}] KWin script registered successfully (id={self.kwin_script_id})")
+            return True
+        else:
+            print(f"[{datetime.datetime.now()}] Warning: failed to load KWin script: {res.stderr or res.stdout}")
+            return False
+
+    def unload_kwin_script(self):
+        try:
+            subprocess.run(["qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", "timetracker_kwin"], capture_output=True)
+        except Exception:
+            pass
+
+    def flush_chunk(self, final=False):
+        if not self.current_chunk:
+            return
+
+        c = self.current_chunk
+        now = datetime.datetime.now()
+        start_dt = c["start_dt"]
+        last_dt = c["last_dt"]
+        duration = max(1, int((last_dt - start_dt).total_seconds()))
+
+        # Soft idle detection: if active on same window > threshold
+        soft_threshold = self.rules.get("soft_idle_threshold_seconds", 900)
+        is_idle = 1 if (duration > soft_threshold and not c["is_locked"]) else 0
+
+        rec_id = self.db.save_record(
+            start_time=start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            end_time=last_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            duration=duration,
+            app_id=c["app_id"],
+            app_name=c["app_name"],
+            window_title=c["window_title"],
+            category=c["category"],
+            is_locked=c["is_locked"],
+            is_idle=is_idle,
+            record_id=c.get("db_id")
+        )
+        c["db_id"] = rec_id
+        self.last_flush_time = time.time()
+
+        if final:
+            self.current_chunk = None
+
+    def check_daily_rollover(self, current_date_str):
+        if self.current_chunk:
+            chunk_date = self.current_chunk["start_dt"].strftime("%Y-%m-%d")
+            if chunk_date != current_date_str:
+                print(f"[{datetime.datetime.now()}] Date rollover detected ({chunk_date} -> {current_date_str}). Exporting report.")
+                self.flush_chunk(final=True)
+                # Export yesterday's report
+                self.export_report(chunk_date)
+
+    def export_report(self, date_str):
+        try:
+            records = self.db.query_day(date_str)
+            if records:
+                content = ReportGenerator.generate_markdown(records, date_str)
+                out_file = REPORTS_DIR / f"{date_str}.md"
+                with open(out_file, "w", encoding="utf-8") as f:
+                    f.write(content)
+                print(f"[{datetime.datetime.now()}] Daily report exported to {out_file}")
+        except Exception as e:
+            print(f"[{datetime.datetime.now()}] Error exporting report for {date_str}: {e}")
+
+    def handle_sample(self, window_data):
+        now = datetime.datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        self.check_daily_rollover(today_str)
+
+        is_locked = self.get_lock_status()
+        if is_locked:
+            app_id = "screensaver"
+            window_title = "屏幕已锁定"
+        elif not window_data:
+            app_id = "plasmashell"
+            window_title = "KDE 桌面空白处"
+        else:
+            app_id = window_data.get("desktopFile") or window_data.get("resourceClass") or window_data.get("resourceName") or "unknown"
+            window_title = window_data.get("caption") or ""
+
+        category, icon, app_name = self.classifier.classify(app_id, window_title, is_locked)
+
+        # Match against current chunk
+        if self.current_chunk:
+            c = self.current_chunk
+            same_app = (c["app_id"] == app_id)
+            same_title = (c["window_title"] == window_title)
+            same_lock = (c["is_locked"] == (1 if is_locked else 0))
+
+            if same_app and same_title and same_lock:
+                c["last_dt"] = now
+                # Periodic flush every 10 seconds for fresh real-time data
+                if time.time() - self.last_flush_time >= 10:
+                    self.flush_chunk(final=False)
+                return
+
+        # State changed or first chunk
+        self.flush_chunk(final=True)
+
+        self.current_chunk = {
+            "start_dt": now,
+            "last_dt": now,
+            "app_id": app_id,
+            "app_name": app_name,
+            "window_title": window_title,
+            "category": category,
+            "is_locked": 1 if is_locked else 0,
+            "db_id": None
+        }
+        self.flush_chunk(final=False)
+
+    def run(self):
+        print(f"[{datetime.datetime.now()}] Starting Desktop TimeTracker Daemon...")
+        ensure_dirs()
+        self.load_kwin_script()
+
+        def sig_handler(sig, frame):
+            print(f"\n[{datetime.datetime.now()}] Received shutdown signal ({sig}). Cleaning up...")
+            self.running = False
+
+        signal.signal(signal.SIGINT, sig_handler)
+        signal.signal(signal.SIGTERM, sig_handler)
+
+        cmd = ["journalctl", "--user", "-u", "plasma-kwin_wayland", "-f", "-o", "cat", "--lines", "0"]
+        self.journal_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+
+        last_heartbeat = time.time()
+
+        try:
+            while self.running:
+                line = self.journal_proc.stdout.readline()
+                if not line:
+                    time.sleep(0.5)
+                    continue
+
+                if "TIMETRACKER_TICK:" in line:
+                    raw_data = line.split("TIMETRACKER_TICK:", 1)[1].strip()
+                    try:
+                        if raw_data == "null":
+                            data = None
+                        else:
+                            data = json.loads(raw_data)
+                        self.handle_sample(data)
+                    except Exception as e:
+                        pass
+
+                # Every 60 seconds check health
+                if time.time() - last_heartbeat > 60:
+                    last_heartbeat = time.time()
+                    # Export today's live report draft
+                    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+                    self.export_report(today_str)
+
+        finally:
+            print(f"[{datetime.datetime.now()}] Finalizing database and unloading script...")
+            self.flush_chunk(final=True)
+            if self.journal_proc:
+                self.journal_proc.terminate()
+            self.unload_kwin_script()
+            print(f"[{datetime.datetime.now()}] TimeTracker Daemon stopped cleanly.")
+
+
+# --- CLI Commands ---
+
+def cmd_today(args):
+    db = Database()
+    target_date = args.date or datetime.datetime.now().strftime("%Y-%m-%d")
+    records = db.query_day(target_date)
+
+    if not records:
+        print(f"\n📅 【{target_date}】今日暂无记录。请确保后台服务已启动 (`timetrack service start`)。\n")
+        return
+
+    total_active = sum(r["duration_seconds"] for r in records if not r["is_locked"])
+    total_locked = sum(r["duration_seconds"] for r in records if r["is_locked"])
+    grand_total = total_active + total_locked
+
+    cat_times = {}
+    app_times = {}
+    win_times = {}
+
+    rules = load_rules()
+    icon_map = {c["name"]: c.get("icon", "📌") for c in rules.get("categories", [])}
+    icon_map["锁屏/休眠"] = "🔒"
+
+    for r in records:
+        dur = r["duration_seconds"]
+        if not r["is_locked"]:
+            cat = r["category"]
+            app = r["app_name"]
+            title = r["window_title"] or "桌面"
+            cat_times[cat] = cat_times.get(cat, 0) + dur
+            app_times[app] = app_times.get(app, 0) + dur
+            win_times[(app, title)] = win_times.get((app, title), 0) + dur
+
+    print(f"\n╔═══════════════════════════════════════════════════════════════╗")
+    print(f"║          📊 桌面时间使用简报 ({target_date})             ║")
+    print(f"╚═══════════════════════════════════════════════════════════════╝")
+    print(f"  ⚡ 专注活跃时长: \033[1;32m{format_duration(total_active)}\033[0m ({((total_active/grand_total*100) if grand_total else 0):.1f}%)")
+    print(f"  🔒 锁屏挂机时长: \033[1;33m{format_duration(total_locked)}\033[0m ({((total_locked/grand_total*100) if grand_total else 0):.1f}%)")
+    print(f"  ⏳ 累计在线时间: {format_duration(grand_total)}")
+    print(f"─────────────────────────────────────────────────────────────────")
+
+    print(f"\n📂 【类别分布】:")
+    for cat, secs in sorted(cat_times.items(), key=lambda x: x[1], reverse=True):
+        ratio = secs / total_active if total_active else 0
+        icon = icon_map.get(cat, "📌")
+        bar = make_bar(ratio, width=16)
+        pct_str = f"{ratio*100:5.1f}%"
+        dur_str = format_duration_short(secs).rjust(8)
+        print(f"  {icon} {cat.ljust(6)} [{bar}] \033[1;36m{pct_str}\033[0m ({dur_str})")
+
+    print(f"\n🏆 【Top 应用排行】:")
+    for idx, (app, secs) in enumerate(sorted(app_times.items(), key=lambda x: x[1], reverse=True)[:7], 1):
+        ratio = secs / total_active if total_active else 0
+        print(f"  {idx}. \033[1m{app}\033[0m: {format_duration(secs)} ({ratio*100:.1f}%)")
+
+    print(f"\n🔍 【关键任务详情】:")
+    for idx, ((app, title), secs) in enumerate(sorted(win_times.items(), key=lambda x: x[1], reverse=True)[:5], 1):
+        clean_title = title if len(title) <= 45 else title[:42] + "..."
+        print(f"  {idx}. [{app}] {clean_title} ({format_duration(secs)})")
+    print("")
+
+
+def cmd_week(args):
+    db = Database()
+    today = datetime.date.today()
+    start = today - datetime.timedelta(days=6)
+    records = db.query_date_range(start.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d"))
+
+    if not records:
+        print(f"\n最近 7 天暂无时间数据。\n")
+        return
+
+    day_totals = {}
+    day_active = {}
+    for i in range(7):
+        d_str = (start + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+        day_totals[d_str] = 0
+        day_active[d_str] = 0
+
+    for r in records:
+        d = r["start_time"][:10]
+        dur = r["duration_seconds"]
+        if d in day_totals:
+            day_totals[d] += dur
+            if not r["is_locked"]:
+                day_active[d] += dur
+
+    max_active = max(day_active.values()) if day_active else 1
+
+    print(f"\n╔═══════════════════════════════════════════════════════════════╗")
+    print(f"║             📈 最近 7 天活跃趋势统计                         ║")
+    print(f"╚═══════════════════════════════════════════════════════════════╝")
+    for d, secs in day_active.items():
+        ratio = secs / max_active if max_active else 0
+        bar = make_bar(ratio, width=15)
+        print(f"  {d}: [{bar}] \033[1;32m{format_duration_short(secs).rjust(7)}\033[0m (总计 {format_duration_short(day_totals[d])})")
+    print("")
+
+
+def cmd_report(args):
+    db = Database()
+    target_date = args.date or datetime.datetime.now().strftime("%Y-%m-%d")
+    records = db.query_day(target_date)
+    md_content = ReportGenerator.generate_markdown(records, target_date)
+
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(md_content)
+        print(f"报告已保存至: {out_path}")
+    else:
+        print(md_content)
+
+
+def cmd_export(args):
+    db = Database()
+    target_date = args.date or datetime.datetime.now().strftime("%Y-%m-%d")
+    records = db.query_day(target_date)
+    md_content = ReportGenerator.generate_markdown(records, target_date)
+    out_file = REPORTS_DIR / f"{target_date}.md"
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(out_file, "w", encoding="utf-8") as f:
+        f.write(md_content)
+    print(f"✅ 每日时间报告已导出: {out_file}")
+
+
+def cmd_status(args):
+    res = subprocess.run(["systemctl", "--user", "is-active", "desktop-timetracker.service"], capture_output=True, text=True)
+    state = res.stdout.strip()
+    color = "\033[1;32m" if state == "active" else "\033[1;31m"
+    print(f"\n服务运行状态: {color}{state.upper()}\033[0m")
+
+    # Check latest record
+    db = Database()
+    with db.get_conn() as conn:
+        cur = conn.execute("SELECT * FROM window_activities ORDER BY id DESC LIMIT 1;")
+        row = cur.fetchone()
+        if row:
+            print(f"最近捕获时间: {row['end_time']}")
+            print(f"当前应用名称: {row['app_name']} ({row['category']})")
+            print(f"当前窗口标题: {row['window_title']}")
+            print(f"当前连续时长: {format_duration(row['duration_seconds'])}\n")
+        else:
+            print("数据库中暂无记录。\n")
+
+
+def cmd_service(args):
+    action = args.action
+    if action == "install":
+        SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
+        service_content = f"""[Unit]
+Description=KDE Wayland Desktop Time Tracker Daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart={BIN_DIR}/desktop-timetracker daemon
+Restart=always
+RestartSec=5s
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target
+"""
+        with open(SERVICE_FILE, "w", encoding="utf-8") as f:
+            f.write(service_content)
+        subprocess.run(["systemctl", "--user", "daemon-reload"])
+        subprocess.run(["systemctl", "--user", "enable", "--now", "desktop-timetracker.service"])
+        print(f"✅ 已成功安装并启动 systemd 用户服务: desktop-timetracker.service")
+    elif action in ["start", "stop", "restart", "status", "enable", "disable"]:
+        subprocess.run(["systemctl", "--user", action, "desktop-timetracker.service"])
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="desktop-timetracker",
+        description="KDE Plasma 6 Wayland 桌面时间记录与分析系统"
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", help="子命令")
+
+    # daemon
+    subparsers.add_parser("daemon", help="启动后台守护采集进程")
+
+    # today
+    parser_today = subparsers.add_parser("today", help="查看今日时间统计看板")
+    parser_today.add_argument("--date", help="指定日期 (YYYY-MM-DD)")
+
+    # week
+    subparsers.add_parser("week", help="查看最近 7 天时间趋势")
+
+    # report
+    parser_rep = subparsers.add_parser("report", help="生成指定日期的 Markdown 报告")
+    parser_rep.add_argument("--date", help="指定日期 (YYYY-MM-DD)")
+    parser_rep.add_argument("--out", help="输出文件路径")
+
+    # export
+    parser_exp = subparsers.add_parser("export", help="导出今日报告至 ~/Documents/TimeReports/")
+    parser_exp.add_argument("--date", help="指定日期 (YYYY-MM-DD)")
+
+    # status
+    subparsers.add_parser("status", help="查看采集服务与当前活动状态")
+
+    # service
+    parser_srv = subparsers.add_parser("service", help="管理 systemd 用户服务")
+    parser_srv.add_argument("action", choices=["install", "start", "stop", "restart", "status", "enable", "disable"])
+
+    args = parser.parse_args()
+
+    if args.subcommand == "daemon":
+        daemon = Daemon()
+        daemon.run()
+    elif args.subcommand == "today":
+        cmd_today(args)
+    elif args.subcommand == "week":
+        cmd_week(args)
+    elif args.subcommand == "report":
+        cmd_report(args)
+    elif args.subcommand == "export":
+        cmd_export(args)
+    elif args.subcommand == "status":
+        cmd_status(args)
+    elif args.subcommand == "service":
+        cmd_service(args)
+    else:
+        # Default to today
+        cmd_today(args)
+
+
+if __name__ == "__main__":
+    main()
