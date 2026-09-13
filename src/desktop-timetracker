@@ -3,11 +3,15 @@
 """
 Desktop TimeTracker for KDE Plasma 6 Wayland
 Zero-dependency, privacy-first, automated desktop activity and time tracking.
-Supports Internationalization (i18n): English (en) and Simplified Chinese (zh).
+Features:
+- Three-Tier Progressive Classification Pipeline (rules.json -> XDG .desktop -> fallback)
+- Full Internationalization (i18n): English (en) and Simplified Chinese (zh)
+- KWin Wayland event-driven watcher and systemd user service
 """
 
 import argparse
 import datetime
+import glob
 import json
 import os
 import signal
@@ -155,7 +159,42 @@ CANONICAL_CATEGORIES = {
     "other": {"zh": "其他应用", "en": "Other Apps", "icon": "📌"}
 }
 
-# Reverse lookup for legacy / raw category names in DB
+# XDG Specificity Priority: maps XDG category tokens to canonical categories
+XDG_CATEGORY_PRIORITY = [
+    ("TerminalEmulator", "terminal"),
+    ("WebBrowser", "browsing"),
+    ("IDE", "development"),
+    ("Development", "development"),
+    ("Debugger", "development"),
+    ("InstantMessaging", "communication"),
+    ("Chat", "communication"),
+    ("IRCClient", "communication"),
+    ("Email", "communication"),
+    ("Telephony", "communication"),
+    ("Game", "media"),
+    ("Player", "media"),
+    ("AudioVideo", "media"),
+    ("Audio", "media"),
+    ("Video", "media"),
+    ("Music", "media"),
+    ("WordProcessor", "notes"),
+    ("Spreadsheet", "notes"),
+    ("Presentation", "notes"),
+    ("Office", "notes"),
+    ("TextEditor", "notes"),
+    ("RasterGraphics", "design"),
+    ("VectorGraphics", "design"),
+    ("3DGraphics", "design"),
+    ("Photography", "design"),
+    ("Graphics", "design"),
+    ("FileManager", "system"),
+    ("Settings", "system"),
+    ("System", "system"),
+    ("Education", "notes"),
+    ("Utility", "other"),
+]
+
+# Reverse lookup for legacy/raw category names in DB
 CATEGORY_NAME_TO_KEY = {}
 for k, v in CANONICAL_CATEGORIES.items():
     CATEGORY_NAME_TO_KEY[k] = k
@@ -163,6 +202,7 @@ for k, v in CANONICAL_CATEGORIES.items():
     CATEGORY_NAME_TO_KEY[v["en"]] = k
     CATEGORY_NAME_TO_KEY[v["en"].lower()] = k
 
+# Fallback manual application names if XDG .desktop is missing
 APP_NAME_MAP = {
     "firefox": "Firefox",
     "google-chrome": "Google Chrome",
@@ -185,7 +225,7 @@ APP_NAME_MAP = {
     "libreoffice": "LibreOffice",
     "telegram-desktop": "Telegram",
     "telegram": "Telegram",
-    "wechat": "微信 (WeChat)",
+    "wechat": "WeChat",
     "qq": "QQ",
     "discord": "Discord",
     "slack": "Slack",
@@ -193,8 +233,8 @@ APP_NAME_MAP = {
     "vlc": "VLC Media Player",
     "mpv": "MPV",
     "spotify": "Spotify",
-    "netease-cloud-music": "网易云音乐 (Netease Music)",
-    "bilibili": "哔哩哔哩 (Bilibili)",
+    "netease-cloud-music": "Netease Cloud Music",
+    "bilibili": "Bilibili",
     "plasmashell": "KDE Desktop",
     "screensaver": "Screen Locked",
     "systemsettings": "System Settings",
@@ -324,7 +364,6 @@ def get_language(cli_lang=None):
     cfg_lang = rules.get("language", "auto")
     if cfg_lang in ["en", "zh"]:
         return cfg_lang
-    # Auto detect from system locale
     sys_locale = (os.environ.get("LC_ALL") or os.environ.get("LANG") or os.environ.get("LANGUAGE") or "").lower()
     if sys_locale.startswith("zh") or "chinese" in sys_locale or "cn" in sys_locale:
         return "zh"
@@ -332,7 +371,6 @@ def get_language(cli_lang=None):
 
 
 def get_category_display(cat_raw, lang="en"):
-    # Normalize
     cat_key = CATEGORY_NAME_TO_KEY.get(cat_raw)
     if not cat_key:
         cat_key = CATEGORY_NAME_TO_KEY.get(cat_raw.lower())
@@ -340,7 +378,6 @@ def get_category_display(cat_raw, lang="en"):
     if cat_key and cat_key in CANONICAL_CATEGORIES:
         item = CANONICAL_CATEGORIES[cat_key]
         return item[lang], item["icon"]
-    # Fallback to custom category name
     return cat_raw, "📌"
 
 
@@ -377,6 +414,79 @@ def make_bar(ratio, width=16):
     sub_char = chars[int(remainder * 8)] if remainder > 0 else ""
     bar = "█" * full_blocks + sub_char
     return bar.ljust(width, "░")
+
+
+class XDGDesktopIndex:
+    """Fast in-memory index for XDG .desktop files across the system."""
+
+    def __init__(self):
+        self.index = {}
+        self.dirs = [
+            "/usr/share/applications",
+            "/usr/local/share/applications",
+            os.path.expanduser("~/.local/share/applications"),
+            "/var/lib/flatpak/exports/share/applications",
+            os.path.expanduser("~/.local/share/flatpak/exports/share/applications"),
+        ]
+        self.scan()
+
+    def scan(self):
+        self.index.clear()
+        for d in self.dirs:
+            if not os.path.isdir(d):
+                continue
+            for path in glob.glob(os.path.join(d, "*.desktop")):
+                stem = os.path.splitext(os.path.basename(path))[0].lower()
+                entry = {"name": "", "name_zh": "", "categories": [], "wm_class": "", "icon": ""}
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        in_section = False
+                        for line in f:
+                            line = line.strip()
+                            if line == "[Desktop Entry]":
+                                in_section = True
+                                continue
+                            elif line.startswith("[") and in_section:
+                                break
+                            if not in_section or "=" not in line:
+                                continue
+                            k, v = line.split("=", 1)
+                            k, v = k.strip(), v.strip()
+                            if k == "Name":
+                                entry["name"] = v
+                            elif k in ["Name[zh_CN]", "Name[zh]"] and not entry["name_zh"]:
+                                entry["name_zh"] = v
+                            elif k == "Categories":
+                                entry["categories"] = [c.strip() for c in v.split(";") if c.strip()]
+                            elif k == "StartupWMClass":
+                                entry["wm_class"] = v.lower()
+                            elif k == "Icon":
+                                entry["icon"] = v
+                except Exception:
+                    continue
+
+                if entry["name"]:
+                    self.index[stem] = entry
+                    if entry["wm_class"]:
+                        self.index[entry["wm_class"]] = entry
+
+    def lookup(self, *keys):
+        for k in keys:
+            if not k:
+                continue
+            k_clean = str(k).lower().strip()
+            if k_clean.endswith(".desktop"):
+                k_clean = k_clean[:-8]
+
+            if k_clean in self.index:
+                return self.index[k_clean]
+
+            # Try prefix stripping (e.g. org.kde.dolphin -> dolphin, com.obsproject.Studio -> studio)
+            if "." in k_clean:
+                sub = k_clean.split(".")[-1]
+                if sub in self.index:
+                    return self.index[sub]
+        return None
 
 
 class Database:
@@ -453,39 +563,81 @@ class Database:
 
 
 class Classifier:
+    """Three-Tier Progressive Classification Pipeline:
+    Tier 1: rules.json (User Custom Overrides)
+    Tier 2: System XDG .desktop Metadata (Weighted Specificity Categories & Localized Names)
+    Tier 3: Fallback (other)
+    """
+
     def __init__(self, rules):
         self.rules = rules
+        self.xdg_index = XDGDesktopIndex()
 
-    def classify(self, app_id, window_title, is_locked):
+    def classify(self, app_id, window_title, is_locked, desktop_file="", resource_class="", resource_name="", lang="en"):
         if is_locked:
-            return "locked", "🔒", "Screen Locked"
+            return "locked", "🔒", I18N[lang]["screen_locked"]
 
         app_id_clean = (app_id or "").lower().strip()
         title_clean = window_title or ""
 
-        friendly_name = APP_NAME_MAP.get(app_id_clean)
+        # Step A: Resolve official application name via XDG Index
+        xdg_entry = self.xdg_index.lookup(desktop_file, resource_class, resource_name, app_id_clean)
+
+        friendly_name = None
+        if xdg_entry:
+            if lang == "zh" and xdg_entry.get("name_zh"):
+                friendly_name = xdg_entry["name_zh"]
+            else:
+                friendly_name = xdg_entry.get("name")
+
+        if not friendly_name:
+            friendly_name = APP_NAME_MAP.get(app_id_clean)
         if not friendly_name:
             if app_id_clean:
-                friendly_name = app_id_clean.replace("-", " ").title()
+                friendly_name = app_id_clean.split(".")[-1].replace("-", " ").replace("_", " ").title()
             else:
-                friendly_name = "Unknown"
+                friendly_name = I18N[lang]["unknown_app"]
 
+        # =========================================================================
+        # TIER 1: rules.json (User Custom Overrides - Highest Priority)
+        # =========================================================================
         for cat in self.rules.get("categories", []):
             cat_id = cat.get("id") or CATEGORY_NAME_TO_KEY.get(cat.get("name", ""), "other")
             icon = cat.get("icon", "📌")
 
-            # Check app match
+            # Check app ID matching
             for a in cat.get("apps", []):
-                if a and a.lower() in app_id_clean:
+                a_lower = a.lower()
+                if a_lower and (
+                    a_lower in app_id_clean or
+                    (resource_class and a_lower in resource_class.lower()) or
+                    (desktop_file and a_lower in desktop_file.lower())
+                ):
                     return cat_id, icon, friendly_name
 
-            # Check title keywords
+            # Check window title keywords
             for kw in cat.get("title_keywords", []):
                 if kw and kw.lower() in title_clean.lower():
                     return cat_id, icon, friendly_name
 
+        # =========================================================================
+        # TIER 2: System XDG .desktop Metadata (Weighted Specificity Categories)
+        # =========================================================================
+        if xdg_entry and xdg_entry.get("categories"):
+            cats = xdg_entry["categories"]
+            for xdg_kw, target_cat in XDG_CATEGORY_PRIORITY:
+                if xdg_kw in cats:
+                    canonical_info = CANONICAL_CATEGORIES.get(target_cat, {})
+                    icon = canonical_info.get("icon", "📌")
+                    return target_cat, icon, friendly_name
+
+        # =========================================================================
+        # TIER 3: Fallback Default
+        # =========================================================================
         default_cat = self.rules.get("default_category", "other")
-        return default_cat, "📌", friendly_name
+        canonical_info = CANONICAL_CATEGORIES.get(default_cat, {})
+        icon = canonical_info.get("icon", "📌")
+        return default_cat, icon, friendly_name
 
 
 class ReportGenerator:
@@ -685,17 +837,37 @@ class Daemon:
         self.check_daily_rollover(today_str)
 
         is_locked = self.get_lock_status()
+        lang = get_language()
+        t = I18N[lang]
+
         if is_locked:
             app_id = "screensaver"
-            window_title = "Screen Locked"
+            window_title = t["screen_locked"]
+            desktop_file = ""
+            resource_class = ""
+            resource_name = ""
         elif not window_data:
             app_id = "plasmashell"
-            window_title = "Desktop"
+            window_title = t["desktop_empty"]
+            desktop_file = "plasmashell"
+            resource_class = "plasmashell"
+            resource_name = "plasmashell"
         else:
-            app_id = window_data.get("desktopFile") or window_data.get("resourceClass") or window_data.get("resourceName") or "unknown"
+            desktop_file = window_data.get("desktopFile") or ""
+            resource_class = window_data.get("resourceClass") or ""
+            resource_name = window_data.get("resourceName") or ""
+            app_id = desktop_file or resource_class or resource_name or "unknown"
             window_title = window_data.get("caption") or ""
 
-        category_key, icon, app_name = self.classifier.classify(app_id, window_title, is_locked)
+        category_key, icon, app_name = self.classifier.classify(
+            app_id=app_id,
+            window_title=window_title,
+            is_locked=is_locked,
+            desktop_file=desktop_file,
+            resource_class=resource_class,
+            resource_name=resource_name,
+            lang=lang
+        )
 
         if self.current_chunk:
             c = self.current_chunk

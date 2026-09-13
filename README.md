@@ -17,12 +17,30 @@ Under the modern **Wayland** display server protocol, traditional X11-based wind
 
 **Desktop TimeTracker** solves this natively:
 1. **Native KWin Wayland Scripting**: Seamlessly embeds into KDE Plasma 6's KWin internal scripting engine and D-Bus interfaces (`org.kde.KWin`, `org.freedesktop.ScreenSaver`). It passively captures active window titles, application identities, and physical lock/sleep states without any cursor interruptions or mouse clicking.
-2. **Zero External Dependencies**: Implemented entirely with standard Python 3 (`sqlite3`, `json`, `datetime`, `subprocess`) and KDE's built-in `qdbus6`. No pip packages, no external build steps.
-3. **Ultra-Low Resource Footprint**: Consumes only **~13 MB RAM** and **< 0.1% CPU** during background operation.
-4. **100% Local & Privacy-First**: No telemetry, no network calls, and no cloud synchronization. All data is persisted exclusively in a local SQLite database (`~/.local/share/timetracker/timetracker.db`).
-5. **Multi-Language Support (i18n)**: Out-of-the-box support for **English** and **Simplified Chinese** across terminal outputs, category labels, and daily Markdown reports. Easily switch anytime via `timetrack lang <en|zh>`.
-6. **Automatic Daily Markdown Reports**: Automatically compiles clean, structured Markdown reports with category breakdowns, application rankings, task captions, and 24-hour activity timelines into `~/Documents/TimeReports/YYYY-MM-DD.md`.
-7. **Systemd User Service**: Managed cleanly as a `systemd --user` daemon that automatically starts and stops alongside your graphical session lifecycle.
+2. **Three-Tier Progressive Classification Pipeline**: Combines user custom overrides (`rules.json`), automatic system XDG `.desktop` metadata inspection with weighted specificity matching, and safe fallback. Newly installed software is categorized automatically out of the box.
+3. **Zero External Dependencies**: Implemented entirely with standard Python 3 (`sqlite3`, `json`, `datetime`, `subprocess`) and KDE's built-in `qdbus6`. No pip packages, no external build steps.
+4. **Ultra-Low Resource Footprint**: Consumes only **~13 MB RAM** and **< 0.1% CPU** during background operation.
+5. **100% Local & Privacy-First**: No telemetry, no network calls, and no cloud synchronization. All data is persisted exclusively in a local SQLite database (`~/.local/share/timetracker/timetracker.db`).
+6. **Multi-Language Support (i18n)**: Out-of-the-box support for **English** and **Simplified Chinese** across terminal outputs, category labels, and daily Markdown reports. Easily switch anytime via `timetrack lang <en|zh>`.
+7. **Automatic Daily Markdown Reports**: Automatically compiles clean, structured Markdown reports with category breakdowns, application rankings, task captions, and 24-hour activity timelines into `~/Documents/TimeReports/YYYY-MM-DD.md`.
+8. **Systemd User Service**: Managed cleanly as a `systemd --user` daemon that automatically starts and stops alongside your graphical session lifecycle.
+
+---
+
+## 🧠 Three-Tier Progressive Classification Pipeline
+
+```mermaid
+flowchart TD
+    A["Active Window (desktopFile, caption)"] --> B{"Tier 1: rules.json Custom Rules<br/>(Exact app name & title keywords)"}
+    B -->|Matched| C["Apply Custom User Category (Highest Priority)"]
+    B -->|Unmatched| D{"Tier 2: System XDG .desktop Metadata<br/>(/usr/share/applications/*.desktop)"}
+    D -->|Categories Found| E["Weighted Specificity Mapping<br/>(e.g. Development -> Development, WebBrowser -> Web Browsing)"]
+    D -->|Unresolved / Script| F["Tier 3: Fallback ('Other Apps')"]
+```
+
+- **Tier 1 (User Rules)**: Highest priority. Explicit overrides configured in `rules.json` always take precedence.
+- **Tier 2 (System XDG Metadata)**: Automatically parses system `.desktop` files across `/usr/share/applications/`, `~/.local/share/applications/`, and Flatpak. Resolves official application names (e.g. `OBS Studio`, `Dolphin`) and maps standard XDG categories (`TerminalEmulator > WebBrowser > IDE/Development > Chat/Email > Game/AudioVideo > Office > Graphics > System`).
+- **Tier 3 (Fallback)**: Gracefully categorizes untracked scripts and background utilities as `Other Apps`.
 
 ---
 

@@ -17,12 +17,30 @@
 
 **Desktop TimeTracker** 采用原生底层方案彻底解决了这一难题：
 1. **KWin 原生 Wayland 脚本驱动**：直接嵌入 KDE Plasma 6 的 KWin 内部脚本引擎与 D-Bus 接口（`org.kde.KWin`、`org.freedesktop.ScreenSaver`），零鼠标打扰、无感捕获当前活动窗口标题、应用标识与物理锁屏/休眠状态。
-2. **零第三方外部依赖**：纯 Python 3 标准库（`sqlite3`、`json`、`datetime`、`subprocess`）结合系统自带的 `qdbus6`。无需额外安装任何 pip 包，无需编译。
-3. **极低资源开销**：常驻内存仅约 **13 MB**，日常后台 CPU 占用率 **< 0.1%**。
-4. **100% 本地与隐私优先**：无网络请求、无遥测上报、无云端同步。所有数据严格存放在本地 SQLite 索引数据库（`~/.local/share/timetracker/timetracker.db`）中。
-5. **多语言国际化 (i18n)**：原生支持 **简体中文** 与 **English** 双语。控制台输出、分类显示及导出的 Markdown 日报均可随时通过 `timetrack lang <zh|en>` 自由切换。
-6. **每日 Markdown 日报自动沉淀**：跨天自动或按需将分类占比、Top 应用排行、任务明细及 24 小时活跃时段编译为精美的 Markdown 报告，自动输出至 `~/Documents/TimeReports/YYYY-MM-DD.md`。
-7. **Systemd 用户级服务托管**：通过 `systemd --user` 服务守护，自动随 KDE 图形会话拉起与管理。
+2. **三层递进分类管道 (Three-Tier Pipeline)**：融合用户自定义规则 (`rules.json`)、系统 XDG `.desktop` 菜单元数据智能解析与安全兜底。新安装的应用程序开箱即用，无需繁琐的手动配置。
+3. **零第三方外部依赖**：纯 Python 3 标准库（`sqlite3`、`json`、`datetime`、`subprocess`）结合系统自带的 `qdbus6`。无需额外安装任何 pip 包，无需编译。
+4. **极低资源开销**：常驻内存仅约 **13 MB**，日常后台 CPU 占用率 **< 0.1%**。
+5. **100% 本地与隐私优先**：无网络请求、无遥测上报、无云端同步。所有数据严格存放在本地 SQLite 索引数据库（`~/.local/share/timetracker/timetracker.db`）中。
+6. **多语言国际化 (i18n)**：原生支持 **简体中文** 与 **English** 双语。控制台输出、分类显示及导出的 Markdown 日报均可随时通过 `timetrack lang <zh|en>` 自由切换。
+7. **每日 Markdown 日报自动沉淀**：跨天自动或按需将分类占比、Top 应用排行、任务明细及 24 小时活跃时段编译为精美的 Markdown 报告，自动输出至 `~/Documents/TimeReports/YYYY-MM-DD.md`。
+8. **Systemd 用户级服务托管**：通过 `systemd --user` 服务守护，自动随 KDE 图形会话拉起与管理。
+
+---
+
+## 🧠 三层递进分类管道 (Three-Tier Progressive Pipeline)
+
+```mermaid
+flowchart TD
+    A["捕获活动窗口 (desktopFile, caption)"] --> B{"第 1 层: rules.json 自定义规则<br/>(按应用名与窗口标题关键词精确匹配)"}
+    B -->|匹配成功| C["应用用户专属分类 (最高优先级)"]
+    B -->|未匹配| D{"第 2 层: 读取系统 XDG .desktop 菜单分类<br/>(/usr/share/applications/*.desktop)"}
+    D -->|解析出 Categories| E["映射至标准大类<br/>(如 Development 自动归入 编程开发)"]
+    D -->|无法解析 / 纯脚本无 desktop| F["第 3 层: 兜底进入「其他应用」"]
+```
+
+- **第 1 层 (用户规则优先)**：最高优先级。`rules.json` 中的应用名称和窗口标题关键字匹配始终优先，方便用户针对个人习惯精确覆盖分类。
+- **第 2 层 (系统 XDG 元数据解析)**：自动扫描并解析 `/usr/share/applications/`、`~/.local/share/applications/` 及 Flatpak 应用的 `.desktop` 文件。精准获取官方应用中文名称（如 `Dolphin 文件管理器`、`OBS Studio`）并基于权重匹配 XDG 标准分类 (`TerminalEmulator > WebBrowser > IDE/Development > Chat/Email > Game/AudioVideo > Office > Graphics > System`)。
+- **第 3 层 (安全兜底)**：对临时脚本或未注册 desktop 文件的应用，自动平滑归入「其他应用 (`other`)」，绝不抛出异常。
 
 ---
 
