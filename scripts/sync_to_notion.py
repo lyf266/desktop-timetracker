@@ -4,21 +4,26 @@
 Desktop TimeTracker - Notion Digital Asset & Development Milestone Sync Script
 =============================================================================
 Synchronizes project metadata, engineering architecture highlights, and version
-milestone changelogs to a Notion database as a curated digital asset.
+milestone changelogs to a Notion database or page as a curated digital asset.
 
 Features:
-- Zero external pip dependencies: Pure Python 3 standard library
-- Dynamic Notion schema inspection (automatic title and attribute detection)
+- Zero external pip dependencies: 100% Python 3 standard library
+- Robust UUID & URL extraction (supports plain 32-hex, UUID with hyphens, and full Notion URLs)
+- Dynamic Notion schema inspection (automatic title, status, select, multi-select, url, date detection)
 - Resilient fallback property adaptation with automatic minimal retry
-- Multi-source token resolution (CLI > ENV > notion.conf > notion.json)
+- Multi-source token resolution (CLI > ENV > notion.conf > notion.json > ~/.config/notion/api_key)
 - Automatic local proxy detection for reliable mainland China network access
-- Comprehensive error diagnosis with actionable resolution steps
+- Lossless rich text chunking adhering to Notion's 2000-character limit
+- Smart block batching ensuring Notion's 100-children limit is never exceeded
+- Dual parent support (supports both Database and Page targets seamlessly)
+- Context-aware error diagnosis with integration name & workspace details
 """
 
 import argparse
 import datetime
 import json
 import os
+import re
 import socket
 import sys
 import urllib.error
@@ -43,11 +48,23 @@ PROJECT_SUBTITLE = (
 )
 
 
-def clean_uuid(raw_id: str) -> str:
-    """Normalize a UUID string by stripping hyphens and whitespace."""
+def clean_uuid(raw_id: str | None) -> str:
+    """
+    Normalize a raw UUID or Notion URL into a clean 32-character hex UUID string.
+    Handles:
+    - 32 hex chars: "3b9f94c67e984bf9934718b861d8d279"
+    - Standard UUID: "3b9f94c6-7e98-4bf9-9347-18b861d8d279"
+    - Notion URL: "https://www.notion.so/workspace/3b9f94c6-7e98-4bf9-9347-18b861d8d279?v=..."
+    - Notion page URL: "https://notion.so/3b9f94c67e984bf9934718b861d8d279"
+    """
     if not raw_id:
         return ""
-    return raw_id.strip().replace("-", "")
+    s = raw_id.strip()
+    # Match 32 hex digits or hyphenated 8-4-4-4-12 hex format
+    match = re.search(r"([0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12})", s)
+    if match:
+        return match.group(1).replace("-", "").lower()
+    return s.replace("-", "").strip().lower()
 
 
 def is_local_proxy_running(host: str = "127.0.0.1", port: int = 10024) -> bool:
@@ -62,7 +79,7 @@ def is_local_proxy_running(host: str = "127.0.0.1", port: int = 10024) -> bool:
 def setup_http_opener(proxy: str | None = None, no_proxy: bool = False) -> urllib.request.OpenerDirector:
     """
     Build a urllib opener configured with appropriate proxy settings.
-    Respects CLI flag, environment variables, or detects local v2rayN proxy.
+    Respects CLI flag, environment variables, or detects local proxy.
     """
     if no_proxy:
         return urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -79,7 +96,7 @@ def setup_http_opener(proxy: str | None = None, no_proxy: bool = False) -> urlli
     if has_env_proxy:
         return urllib.request.build_opener()
 
-    # Fallback to local v2rayN proxy if listening
+    # Fallback to local proxy if listening
     if is_local_proxy_running("127.0.0.1", 10024):
         handlers = urllib.request.ProxyHandler(
             {"http": FALLBACK_LOCAL_PROXY, "https": FALLBACK_LOCAL_PROXY}
@@ -97,14 +114,20 @@ def resolve_notion_token(cli_token: str | None = None) -> tuple[str | None, str 
     2. Environment variables: NOTION_API_KEY, NOTION_TOKEN
     3. Systemd environment file: ~/.config/environment.d/notion.conf
     4. App config file: ~/.config/timetracker/notion.json
+    5. Standard Notion API key file: ~/.config/notion/api_key
     """
     if cli_token and cli_token.strip():
         return cli_token.strip(), "CLI argument (--token)"
 
-    env_key = os.environ.get("NOTION_API_KEY") or os.environ.get("NOTION_TOKEN")
-    if env_key and env_key.strip():
-        var_name = "NOTION_API_KEY" if os.environ.get("NOTION_API_KEY") else "NOTION_TOKEN"
-        return env_key.strip(), f"Environment variable ({var_name})"
+    # Check NOTION_API_KEY
+    api_key = (os.environ.get("NOTION_API_KEY") or "").strip()
+    if api_key:
+        return api_key, "Environment variable (NOTION_API_KEY)"
+
+    # Check NOTION_TOKEN
+    notion_token = (os.environ.get("NOTION_TOKEN") or "").strip()
+    if notion_token:
+        return notion_token, "Environment variable (NOTION_TOKEN)"
 
     # Fallback: ~/.config/environment.d/notion.conf
     conf_path = Path.home() / ".config" / "environment.d" / "notion.conf"
@@ -136,6 +159,17 @@ def resolve_notion_token(cli_token: str | None = None) -> tuple[str | None, str 
         except Exception:
             pass
 
+    # Fallback: ~/.config/notion/api_key
+    notion_api_key_path = Path.home() / ".config" / "notion" / "api_key"
+    if notion_api_key_path.exists():
+        try:
+            with open(notion_api_key_path, "r", encoding="utf-8") as f:
+                val = f.read().strip()
+                if val:
+                    return val, str(notion_api_key_path)
+        except Exception:
+            pass
+
     return None, None
 
 
@@ -146,8 +180,8 @@ def resolve_database_id(cli_db_id: str | None = None) -> tuple[str, str]:
     if cli_db_id and cli_db_id.strip():
         return clean_uuid(cli_db_id), "CLI argument (--database-id)"
 
-    env_db = os.environ.get("NOTION_DATABASE_ID")
-    if env_db and env_db.strip():
+    env_db = (os.environ.get("NOTION_DATABASE_ID") or "").strip()
+    if env_db:
         return clean_uuid(env_db), "Environment variable (NOTION_DATABASE_ID)"
 
     json_path = Path.home() / ".config" / "timetracker" / "notion.json"
@@ -205,24 +239,20 @@ def notion_api_request(
         return {"_error": True, "exception": str(exc)}
 
 
-def build_page_blocks() -> list[dict]:
+def make_rich_text_chunks(text: str, bold: bool = False, italic: bool = False, link: str | None = None) -> list[dict]:
     """
-    Construct the rich content blocks hierarchy conforming to Notion's Block API:
-    - Top: Callout block (Asset Summary Dashboard)
-    - Divider
-    - Heading 2: Development Milestones & Evolution
-    - Cascading Toggle Block 1: Milestone 1 (v1.0.0)
-    - Cascading Toggle Block 2: Milestone 2 (v1.0.1)
-    - Cascading Toggle Block 3: Milestone 3 (v1.1.0)
-    - Cascading Toggle Block 4: Architecture Highlights & Engineering Metrics
+    Split text into chunks of at most 2000 characters each, returning a list of Notion rich text objects.
+    Adheres strictly to Notion API's 2000-char limit per rich text object without truncating content.
     """
-
-    def make_rich_text(text: str, bold: bool = False, italic: bool = False, link: str | None = None) -> dict:
-        # Notion limit: max 2000 chars per text object
-        safe_content = text[:2000]
+    if not text:
+        return []
+    chunks = []
+    chunk_size = 2000
+    for i in range(0, len(text), chunk_size):
+        chunk = text[i : i + chunk_size]
         obj = {
             "type": "text",
-            "text": {"content": safe_content},
+            "text": {"content": chunk},
             "annotations": {
                 "bold": bold,
                 "italic": italic,
@@ -234,35 +264,48 @@ def build_page_blocks() -> list[dict]:
         }
         if link:
             obj["text"]["link"] = {"url": link}
-        return obj
+        chunks.append(obj)
+    return chunks
 
-    def make_bullet(bold_prefix: str, content: str) -> dict:
-        return {
-            "object": "block",
-            "type": "bulleted_list_item",
-            "bulleted_list_item": {
-                "rich_text": [
-                    make_rich_text(bold_prefix, bold=True),
-                    make_rich_text(content),
-                ]
-            },
-        }
 
+def make_bullet(bold_prefix: str, content: str) -> dict:
+    """Construct a bulleted list item block with bold prefix and detailed explanation."""
+    prefix_objs = make_rich_text_chunks(bold_prefix, bold=True)
+    content_objs = make_rich_text_chunks(content)
+    return {
+        "object": "block",
+        "type": "bulleted_list_item",
+        "bulleted_list_item": {
+            "rich_text": prefix_objs + content_objs,
+        },
+    }
+
+
+def build_page_blocks() -> list[dict]:
+    """
+    Construct the rich content blocks hierarchy conforming to Notion's Block API:
+    - Top: Callout block (Asset Summary Dashboard)
+    - Divider
+    - Heading 2: Development Milestones & Evolution
+    - Cascading Toggle Block 1: Milestone 1 (v1.0.0)
+    - Cascading Toggle Block 2: Milestone 2 (v1.0.1)
+    - Cascading Toggle Block 3: Milestone 3 (v1.1.0)
+    - Cascading Toggle Block 4: Architecture Highlights & Engineering Metrics
+    """
     # 1. Asset Summary Callout Block
-    callout_rich_text = [
-        make_rich_text(f"{PROJECT_TITLE} - 数字化资产看板\n", bold=True),
-        make_rich_text(f"{PROJECT_SUBTITLE}\n\n", italic=True),
-        make_rich_text("• 项目名称: ", bold=True),
-        make_rich_text(f"{PROJECT_TITLE}\n"),
-        make_rich_text("• 核心技术栈: ", bold=True),
-        make_rich_text(f"{PROJECT_TECH_STACK}\n"),
-        make_rich_text("• 资源占用指标: ", bold=True),
-        make_rich_text(f"{PROJECT_RESOURCE_METRICS}\n"),
-        make_rich_text("• 开源许可证: ", bold=True),
-        make_rich_text(f"{PROJECT_LICENSE} License\n"),
-        make_rich_text("• 代码仓库: ", bold=True),
-        make_rich_text(PROJECT_REPO_URL, link=PROJECT_REPO_URL),
-    ]
+    callout_rich_text = []
+    callout_rich_text.extend(make_rich_text_chunks(f"{PROJECT_TITLE} - 数字化资产看板\n", bold=True))
+    callout_rich_text.extend(make_rich_text_chunks(f"{PROJECT_SUBTITLE}\n\n", italic=True))
+    callout_rich_text.extend(make_rich_text_chunks("• 项目名称: ", bold=True))
+    callout_rich_text.extend(make_rich_text_chunks(f"{PROJECT_TITLE}\n"))
+    callout_rich_text.extend(make_rich_text_chunks("• 核心技术栈: ", bold=True))
+    callout_rich_text.extend(make_rich_text_chunks(f"{PROJECT_TECH_STACK}\n"))
+    callout_rich_text.extend(make_rich_text_chunks("• 资源占用指标: ", bold=True))
+    callout_rich_text.extend(make_rich_text_chunks(f"{PROJECT_RESOURCE_METRICS}\n"))
+    callout_rich_text.extend(make_rich_text_chunks("• 开源许可证: ", bold=True))
+    callout_rich_text.extend(make_rich_text_chunks(f"{PROJECT_LICENSE} License\n"))
+    callout_rich_text.extend(make_rich_text_chunks("• 代码仓库: ", bold=True))
+    callout_rich_text.extend(make_rich_text_chunks(PROJECT_REPO_URL, link=PROJECT_REPO_URL))
 
     callout_block = {
         "object": "block",
@@ -280,7 +323,7 @@ def build_page_blocks() -> list[dict]:
         "object": "block",
         "type": "heading_2",
         "heading_2": {
-            "rich_text": [make_rich_text("📦 项目里程碑与开发日志 (Development Milestones)")]
+            "rich_text": make_rich_text_chunks("📦 项目里程碑与开发日志 (Development Milestones)"),
         },
     }
 
@@ -289,9 +332,7 @@ def build_page_blocks() -> list[dict]:
         "object": "block",
         "type": "toggle",
         "toggle": {
-            "rich_text": [
-                make_rich_text("🚀 Milestone 1 (v1.0.0): 原生 KWin Wayland 零侵入采集引擎与基础设施", bold=True)
-            ],
+            "rich_text": make_rich_text_chunks("🚀 Milestone 1 (v1.0.0): 原生 KWin Wayland 零侵入采集引擎与基础设施", bold=True),
             "children": [
                 make_bullet(
                     "原生 KWin Wayland 事件监听：",
@@ -322,9 +363,7 @@ def build_page_blocks() -> list[dict]:
         "object": "block",
         "type": "toggle",
         "toggle": {
-            "rich_text": [
-                make_rich_text("🌐 Milestone 2 (v1.0.1): 纯净多语言 (i18n) 重构与物理隔离", bold=True)
-            ],
+            "rich_text": make_rich_text_chunks("🌐 Milestone 2 (v1.0.1): 纯净多语言 (i18n) 重构与物理隔离", bold=True),
             "children": [
                 make_bullet(
                     "架构级多语言国际化解耦：",
@@ -351,9 +390,7 @@ def build_page_blocks() -> list[dict]:
         "object": "block",
         "type": "toggle",
         "toggle": {
-            "rich_text": [
-                make_rich_text("🧠 Milestone 3 (v1.1.0): 三层递进分类管道设计与元数据加权引擎", bold=True)
-            ],
+            "rich_text": make_rich_text_chunks("🧠 Milestone 3 (v1.1.0): 三层递进分类管道设计与元数据加权引擎", bold=True),
             "children": [
                 make_bullet(
                     "第 1 层（用户规则优先）：",
@@ -380,9 +417,7 @@ def build_page_blocks() -> list[dict]:
         "object": "block",
         "type": "toggle",
         "toggle": {
-            "rich_text": [
-                make_rich_text("⚡ 系统架构亮点与关键设计决策 (Engineering Highlights)", bold=True)
-            ],
+            "rich_text": make_rich_text_chunks("⚡ 系统架构亮点与关键设计决策 (Engineering Highlights)", bold=True),
             "children": [
                 make_bullet(
                     "零外部 pip 依赖哲学：",
@@ -406,14 +441,16 @@ def build_page_blocks() -> list[dict]:
 def build_properties_payload(db_properties: dict) -> tuple[dict, str]:
     """
     Introspect database properties to match the title field and safely populate
-    optional columns (URL, Date, Description, Tags) if available in the database schema.
+    optional columns (URL, Status, Select, Multi-select, Date, Description) if available.
+    Adheres strictly to requirement:
+    "If the database has URL or Status or Multi-select properties, adaptively populate what is safe."
     """
     props_payload = {}
     title_key = None
 
     # 1. Identify title property (mandatory in Notion)
     for prop_name, prop_info in db_properties.items():
-        if prop_info.get("type") == "title":
+        if isinstance(prop_info, dict) and prop_info.get("type") == "title":
             title_key = prop_name
             break
 
@@ -430,38 +467,85 @@ def build_properties_payload(db_properties: dict) -> tuple[dict, str]:
     }
 
     # 2. Adaptive optional properties inspection
+    date_matched = False
     for prop_name, prop_info in db_properties.items():
+        if not isinstance(prop_info, dict):
+            continue
         ptype = prop_info.get("type")
         lower_name = prop_name.lower()
 
         # URL field
-        if ptype == "url" and any(k in lower_name for k in ("url", "repo", "link", "仓库", "链接", "github")):
-            props_payload[prop_name] = {"url": PROJECT_REPO_URL}
+        if ptype == "url":
+            if any(k in lower_name for k in ("url", "repo", "link", "仓库", "链接", "github", "项目", "代码")):
+                props_payload[prop_name] = {"url": PROJECT_REPO_URL}
+            elif "url" not in [k.lower() for k in props_payload.keys()]:
+                props_payload[prop_name] = {"url": PROJECT_REPO_URL}
 
-        # Date field
-        elif ptype == "date" and any(k in lower_name for k in ("date", "创建", "时间", "日期", "created")):
-            props_payload[prop_name] = {"date": {"start": datetime.date.today().isoformat()}}
+        # Date field (prefer creation/start date; populate only one date column)
+        elif ptype == "date" and not date_matched:
+            if any(k in lower_name for k in ("date", "创建", "时间", "日期", "created", "开始", "start")):
+                props_payload[prop_name] = {"date": {"start": datetime.date.today().isoformat()}}
+                date_matched = True
 
         # Summary / Description rich_text field
-        elif ptype == "rich_text" and any(k in lower_name for k in ("desc", "summary", "描述", "简介", "备注", "看板")):
+        elif ptype == "rich_text" and any(k in lower_name for k in ("desc", "summary", "描述", "简介", "备注", "看板", "摘要", "说明")):
             props_payload[prop_name] = {
-                "rich_text": [
-                    {
-                        "type": "text",
-                        "text": {"content": PROJECT_SUBTITLE[:1800]},
-                    }
-                ]
+                "rich_text": make_rich_text_chunks(PROJECT_SUBTITLE),
             }
 
-        # Status / Select field (only map if safe existing option matches)
-        elif ptype == "select":
-            options = [opt.get("name", "") for opt in prop_info.get("select", {}).get("options", [])]
-            for candidate in ("已完成", "Active", "稳定版", "发布", "Done", "数字资产", "项目"):
-                if candidate in options:
-                    props_payload[prop_name] = {"select": {"name": candidate}}
+        # Native Notion 'status' field (explicitly required)
+        elif ptype == "status":
+            status_meta = prop_info.get("status") or {}
+            options = [opt.get("name", "") for opt in status_meta.get("options", []) if isinstance(opt, dict)]
+            # Match status candidates (Done, Complete, Active, Completed, 进行中, 已完成)
+            matched_status = None
+            for candidate in ("已完成", "完成", "Done", "Complete", "Active", "进行中", "稳定版", "发布"):
+                for opt_name in options:
+                    if candidate in opt_name:
+                        matched_status = opt_name
+                        break
+                if matched_status:
                     break
+            if matched_status:
+                props_payload[prop_name] = {"status": {"name": matched_status}}
+
+        # Notion 'select' field
+        elif ptype == "select":
+            select_meta = prop_info.get("select") or {}
+            options = [opt.get("name", "") for opt in select_meta.get("options", []) if isinstance(opt, dict)]
+            matched_option = None
+            for candidate in ("已完成", "有效", "Active", "稳定版", "发布", "Done", "数字资产", "项目", "工具"):
+                for opt_name in options:
+                    if candidate in opt_name:
+                        matched_option = opt_name
+                        break
+                if matched_option:
+                    break
+            if matched_option:
+                props_payload[prop_name] = {"select": {"name": matched_option}}
+
+        # Notion 'multi_select' field (explicitly required)
+        elif ptype == "multi_select":
+            mselect_meta = prop_info.get("multi_select") or {}
+            options = [opt.get("name", "") for opt in mselect_meta.get("options", []) if isinstance(opt, dict)]
+            matched_tags = []
+            tag_candidates = ("Python", "KDE", "Wayland", "Linux", "开源", "项目", "编程", "工具", "数字资产", "工作", "效率")
+            for cand in tag_candidates:
+                for opt_name in options:
+                    if cand.lower() in opt_name.lower() and opt_name not in matched_tags:
+                        matched_tags.append(opt_name)
+            if matched_tags:
+                props_payload[prop_name] = {"multi_select": [{"name": t} for t in matched_tags[:3]]}
 
     return props_payload, title_key
+
+
+def fetch_bot_info(opener: urllib.request.OpenerDirector, token: str, verbose: bool = False) -> dict | None:
+    """Fetch current bot and workspace metadata from Notion API."""
+    res = notion_api_request(opener=opener, token=token, method="GET", endpoint="/users/me", verbose=verbose)
+    if not res.get("_error"):
+        return res
+    return None
 
 
 def sync_to_notion(
@@ -471,11 +555,27 @@ def sync_to_notion(
     dry_run: bool = False,
     verbose: bool = False,
 ) -> int:
-    """Main synchronization logic with dynamic schema resolution and resilient fallback."""
+    """
+    Main synchronization logic:
+    1. Introspect target database schema (or parent page if database not found)
+    2. Adaptively build properties payload (Title, URL, Status, Multi-select, Date, Description)
+    3. Construct structured blocks hierarchy
+    4. Slices <=100 blocks for creation, appends overflow blocks via block children API
+    5. Automatic resilient retry with title-only if custom properties trigger HTTP 400
+    """
     print("=" * 68)
     print("⏱️  Desktop TimeTracker -> Notion 数字资产沉淀工具")
     print("=" * 68)
-    print(f"目标数据库 ID : {database_id}")
+    print(f"目标 ID : {database_id}")
+
+    # Query bot information for enhanced diagnostics
+    bot_info = fetch_bot_info(opener, token, verbose=verbose)
+    bot_name = (bot_info.get("name") if bot_info else None) or "你的 Notion 集成"
+    workspace_name = (bot_info.get("bot", {}).get("workspace_name") if bot_info else None) or "当前工作区"
+
+    is_database = True
+    parent_payload = {"database_id": database_id}
+    properties_schema = {}
 
     # 1. Retrieve Database Schema
     print("[-] 正在探测 Notion 数据库结构与字段元数据...")
@@ -488,56 +588,93 @@ def sync_to_notion(
     )
 
     if db_resp.get("_error"):
-        err_info = db_resp.get("error_data", {})
-        status_code = err_info.get("http_status") or db_resp.get("status")
-        msg = err_info.get("message", db_resp.get("exception", "Unknown error"))
+        status_code = (db_resp.get("error_data") or {}).get("http_status") or db_resp.get("status")
+        msg = (db_resp.get("error_data") or {}).get("message", db_resp.get("exception", "Unknown error"))
 
-        if dry_run:
-            print(f"[⚠️ 提示] 在线查询数据库属性失败 (HTTP {status_code}: {msg})。")
-            print("由于开启了 --dry-run 模拟模式，将采用标准数据库 Schema 继续构建数据载荷进行本地校验...")
-            properties_schema = {
-                "Name": {"type": "title"},
-                "URL": {"type": "url"},
-                "Date": {"type": "date"},
-            }
-        else:
-            print("\n" + "!" * 68)
-            print(f"[❌ 错误] 无法访问 Notion 数据库 (HTTP {status_code})")
-            print(f"详细信息: {msg}")
-            print("!" * 68)
+        # If 404, probe if target ID might be a parent Page instead of a Database
+        if status_code == 404 and not dry_run:
+            if verbose:
+                print(f"[DEBUG] Database not found; checking if ID {database_id} is a Page...")
+            page_probe = notion_api_request(opener, token, "GET", f"/pages/{database_id}", verbose=verbose)
+            if not page_probe.get("_error"):
+                print(f"[✅] 成功连接至父级页面 (Page ID: {database_id})")
+                is_database = False
+                parent_payload = {"page_id": database_id}
+                properties_schema = {"title": {"type": "title"}}
 
-            if status_code == 404:
-                print("\n💡 常见原因与解决指引:")
-                print("1. 集成尚未共享到该数据库:")
-                print("   打开 Notion 目标数据库页面 -> 点击右上角「...」->「Connections / 连接」-> 添加你的集成。")
-                print("2. 数据库 ID 不正确:")
-                print(f"   当前传入 ID: {database_id}")
-                print("   请确认数据库 URL 中的 32 位 UUID 是否正确。")
-            elif status_code == 401:
-                print("\n💡 认证失败指引:")
-                print("1. 请检查 Token 是否有效或是否被 Notion 撤销。")
-            sys.stdout.flush()
-            return 1
+        if is_database and db_resp.get("_error"):
+            if dry_run:
+                print(f"[⚠️ 提示] 在线查询数据库属性返回 (HTTP {status_code}: {msg})。")
+                print("由于开启了 --dry-run 模拟模式，将采用标准数据库 Schema 继续构建数据载荷进行本地校验...")
+                properties_schema = {
+                    "Name": {"type": "title"},
+                    "URL": {"type": "url"},
+                    "Status": {"type": "status", "status": {"options": [{"name": "已完成"}]}},
+                    "Tags": {"type": "multi_select", "multi_select": {"options": [{"name": "Python"}, {"name": "开源"}]}},
+                    "Date": {"type": "date"},
+                }
+            else:
+                print("\n" + "!" * 68)
+                print(f"[❌ 错误] 无法访问目标 Notion 资源 (HTTP {status_code})")
+                print(f"详细信息: {msg}")
+                print("!" * 68)
+
+                if status_code == 404:
+                    print("\n💡 常见原因与解决指引:")
+                    print(f"1. 集成尚未共享到该数据库/页面:")
+                    print(f"   当前集成名称 : 「{bot_name}」 (工作区: {workspace_name})")
+                    print("   授权三步操作:")
+                    print(f"     a. 在浏览器打开目标数据库/页面 (ID: {database_id})")
+                    print("     b. 点击右上角「...」菜单 -> 选择「Connections / 连接」")
+                    print(f"     c. 在搜索框搜索并添加集成「{bot_name}」")
+                    print("     d. 重新运行本脚本即可立即同步！")
+                    print("2. 数据库 ID 不正确:")
+                    print(f"   当前传入 ID: {database_id}")
+                    print("   请确认数据库 URL 中的 32 位 UUID 是否正确。")
+                elif status_code == 401:
+                    print("\n💡 认证失败指引:")
+                    print("1. 请检查 Token 是否有效或是否被 Notion 撤销。")
+                sys.stdout.flush()
+                return 1
     else:
         db_title_arr = db_resp.get("title", [])
         db_title = "".join(t.get("plain_text", "") for t in db_title_arr) or "未命名数据库"
         print(f"[✅] 成功连接至数据库: 「{db_title}」")
         properties_schema = db_resp.get("properties", {})
 
-    props_payload, title_key = build_properties_payload(properties_schema)
-    print(f"[ℹ️] 识别主标题属性列: 「{title_key}」")
-    if len(props_payload) > 1:
+    # Build properties payload
+    if is_database:
+        props_payload, title_key = build_properties_payload(properties_schema)
+        print(f"[ℹ️] 识别主标题属性列: 「{title_key}」")
         extra_keys = [k for k in props_payload.keys() if k != title_key]
-        print(f"[ℹ️] 自适应适配属性列: {', '.join(extra_keys)}")
+        if extra_keys:
+            print(f"[ℹ️] 自适应适配属性列: {', '.join(extra_keys)}")
+    else:
+        # Parent is a Page: only 'title' is valid in properties
+        props_payload = {
+            "title": [
+                {
+                    "type": "text",
+                    "text": {"content": PROJECT_PAGE_TITLE},
+                }
+            ]
+        }
+        title_key = "title"
+        print("[ℹ️] 父级为 Page 容器，主标题属性: 「title」")
 
     # 2. Build Content Blocks
     children_blocks = build_page_blocks()
     print(f"[ℹ️] 构建结构化块组件完成 (共 {len(children_blocks)} 个顶级块，包含资产看板与 4 组级联折叠清单)")
 
+    # Adhere to Notion's <=100 children blocks per call limit
+    first_batch = children_blocks[:100]
+    overflow_blocks = children_blocks[100:]
+
     page_payload = {
-        "parent": {"database_id": database_id},
+        "parent": parent_payload,
         "properties": props_payload,
-        "children": children_blocks,
+        "children": first_batch,
+        "icon": {"type": "emoji", "emoji": "⏱️"},
     }
 
     # 3. Handle Dry-Run Mode
@@ -545,8 +682,12 @@ def sync_to_notion(
         print("\n" + "-" * 68)
         print("🔍 [DRY-RUN 模拟模式] 未向 Notion 写入真实数据。以下是生成的完整请求载荷预览:")
         print("-" * 68)
-        print(json.dumps(page_payload, indent=2, ensure_ascii=False)[:3500])
-        print("\n... [已截断多余输出] ...")
+        preview_json = json.dumps(page_payload, indent=2, ensure_ascii=False)
+        print(preview_json[:3500])
+        if len(preview_json) > 3500:
+            print("\n... [已截断多余输出] ...")
+        if overflow_blocks:
+            print(f"\n[ℹ️] 检测到额外 {len(overflow_blocks)} 个块将在页面创建后通过 PATCH 自动追加。")
         print("=" * 68)
         print("✅ Dry-Run 校验通过！数据载荷与块结构完全符合 Notion API 规范。")
         return 0
@@ -588,6 +729,23 @@ def sync_to_notion(
 
     page_id = create_resp.get("id")
     page_url = create_resp.get("url")
+
+    # 6. Append overflow blocks if any (>100 blocks batching)
+    if overflow_blocks and page_id:
+        print(f"[-] 正在追加剩余 {len(overflow_blocks)} 个内容块...")
+        for i in range(0, len(overflow_blocks), 100):
+            batch = overflow_blocks[i : i + 100]
+            append_resp = notion_api_request(
+                opener=opener,
+                token=token,
+                method="PATCH",
+                endpoint=f"/blocks/{page_id}/children",
+                payload={"children": batch},
+                verbose=verbose,
+            )
+            if append_resp.get("_error"):
+                print(f"[⚠️ 警告] 追加第 {i//100 + 1} 批内容块失败: {append_resp.get('error_data')}")
+
     print("\n" + "=" * 68)
     print("🎉 恭喜！Desktop TimeTracker 开发日志与数字资产已成功写入 Notion！")
     print(f"• 页面 ID : {page_id}")
@@ -599,18 +757,18 @@ def sync_to_notion(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="将 Desktop TimeTracker 项目元数据、设计决策与开发日志写入 Notion 数据库。"
+        description="将 Desktop TimeTracker 项目元数据、设计决策与开发日志写入 Notion 数据库或页面。"
     )
     parser.add_argument(
         "--token",
         "-t",
-        help="Notion Integration Token (留空则依次从环境变量、notion.conf、notion.json 中查找)",
+        help="Notion Integration Token (留空则依次从环境变量、notion.conf、notion.json、~/.config/notion/api_key 中查找)",
     )
     parser.add_argument(
         "--database-id",
         "-d",
         default=None,
-        help=f"目标 Notion 数据库 ID (默认: {DEFAULT_DATABASE_ID})",
+        help=f"目标 Notion 数据库或页面 ID (默认: {DEFAULT_DATABASE_ID})",
     )
     parser.add_argument(
         "--proxy",
@@ -650,7 +808,9 @@ def main():
         print('     export NOTION_API_KEY="ntn_..."')
         print("  3. 专属配置文件 (~/.config/timetracker/notion.json):")
         print('     {"notion_token": "ntn_...", "database_id": "3b9f94c67e984bf9934718b861d8d279"}')
-        print("  4. systemd 环境配置 (~/.config/environment.d/notion.conf):")
+        print("  4. 标准 Notion 密钥文件 (~/.config/notion/api_key):")
+        print("     ntn_...")
+        print("  5. systemd 环境配置 (~/.config/environment.d/notion.conf):")
         print("     NOTION_TOKEN=ntn_...")
         print("\nToken 获取与授权三步指南：")
         print("  步骤 A: 登录 https://www.notion.so/profile/integrations 创建或获取内部集成密钥。")
