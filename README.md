@@ -1,5 +1,7 @@
 # Desktop TimeTracker (`timetrack`)
 
+> 🌐 **Language / 语言**: English | [<u><font color="#0969da">简体中文</font></u>](README_zh.md)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20KDE%20Wayland-brightgreen.svg)]()
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)]()
