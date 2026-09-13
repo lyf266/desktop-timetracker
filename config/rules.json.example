@@ -1,6 +1,8 @@
 {
+  "language": "auto",
   "categories": [
     {
+      "id": "development",
       "name": "编程开发",
       "icon": "💻",
       "apps": [
@@ -14,6 +16,7 @@
       ]
     },
     {
+      "id": "terminal",
       "name": "终端运维",
       "icon": "📟",
       "apps": [
@@ -23,6 +26,7 @@
       "title_keywords": []
     },
     {
+      "id": "browsing",
       "name": "网页浏览",
       "icon": "🌐",
       "apps": [
@@ -32,6 +36,7 @@
       "title_keywords": []
     },
     {
+      "id": "communication",
       "name": "即时通讯",
       "icon": "💬",
       "apps": [
@@ -41,6 +46,7 @@
       "title_keywords": ["Telegram", "微信", "Discord", "Slack", "QQ"]
     },
     {
+      "id": "notes",
       "name": "文档笔记",
       "icon": "📝",
       "apps": [
@@ -50,6 +56,7 @@
       "title_keywords": ["Obsidian", "Notion", "WPS", "PDF", "LibreOffice", "Typora"]
     },
     {
+      "id": "media",
       "name": "媒体娱乐",
       "icon": "🎬",
       "apps": [
@@ -59,6 +66,7 @@
       "title_keywords": ["Bilibili", "YouTube", "哔哩哔哩", "Spotify", "Steam"]
     },
     {
+      "id": "design",
       "name": "图形设计",
       "icon": "🎨",
       "apps": [
@@ -67,6 +75,7 @@
       "title_keywords": ["Blender", "GIMP", "Krita", "Figma"]
     },
     {
+      "id": "system",
       "name": "系统桌面",
       "icon": "⚙️",
       "apps": [
@@ -75,7 +84,7 @@
       "title_keywords": ["Desktop", "系统设置", "Dolphin"]
     }
   ],
-  "default_category": "其他应用",
+  "default_category": "other",
   "soft_idle_threshold_seconds": 900,
   "sample_interval_seconds": 5
 }

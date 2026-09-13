@@ -7,7 +7,7 @@
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)]()
 [![Arch Linux](https://img.shields.io/badge/Arch%20Linux-AUR%20Ready-1793d1.svg)]()
 
-> 专为 **KDE Plasma 6 (Wayland)** 打造的轻量级、零第三方依赖、100% 本地隐私的自动化桌面屏幕与时间追踪系统。
+专为 **KDE Plasma 6 (Wayland)** 打造的轻量级、零第三方依赖、100% 本地隐私的自动化桌面屏幕与时间追踪系统。
 
 ---
 
@@ -20,8 +20,9 @@
 2. **零第三方外部依赖**：纯 Python 3 标准库（`sqlite3`、`json`、`datetime`、`subprocess`）结合系统自带的 `qdbus6`。无需额外安装任何 pip 包，无需编译。
 3. **极低资源开销**：常驻内存仅约 **13 MB**，日常后台 CPU 占用率 **< 0.1%**。
 4. **100% 本地与隐私优先**：无网络请求、无遥测上报、无云端同步。所有数据严格存放在本地 SQLite 索引数据库（`~/.local/share/timetracker/timetracker.db`）中。
-5. **每日 Markdown 日报自动沉淀**：跨天自动或按需将分类占比、Top 应用排行、任务明细及 24 小时活跃时段编译为精美的 Markdown 报告，自动输出至 `~/Documents/TimeReports/YYYY-MM-DD.md`。
-6. **Systemd 用户级服务托管**：通过 `systemd --user` 服务守护，自动随 KDE 图形会话拉起与管理。
+5. **多语言国际化 (i18n)**：原生支持 **简体中文** 与 **English** 双语。控制台输出、分类显示及导出的 Markdown 日报均可随时通过 `timetrack lang <zh|en>` 自由切换。
+6. **每日 Markdown 日报自动沉淀**：跨天自动或按需将分类占比、Top 应用排行、任务明细及 24 小时活跃时段编译为精美的 Markdown 报告，自动输出至 `~/Documents/TimeReports/YYYY-MM-DD.md`。
+7. **Systemd 用户级服务托管**：通过 `systemd --user` 服务守护，自动随 KDE 图形会话拉起与管理。
 
 ---
 
@@ -50,6 +51,7 @@ flowchart TD
         Today["timetrack today (今日看板)"]
         Week["timetrack week (周趋势)"]
         Status["timetrack status (实时状态)"]
+        Lang["timetrack lang (切换语言)"]
         Export["timetrack export (导出报表)"]
     end
 
@@ -105,9 +107,18 @@ timetrack week
 # 查看服务运行状态、当前前台应用与窗口标题
 timetrack status
 
+# 切换全局显示语言 (中文/英文/跟随系统)
+timetrack lang zh
+timetrack lang en
+timetrack lang auto
+
+# 单次命令临时指定语言输出
+timetrack today --lang en
+timetrack today --lang zh
+
 # 手动导出今日报告（或指定日期）至 ~/Documents/TimeReports/
 timetrack export
-timetrack export --date 2026-09-12
+timetrack export --date 2026-09-12 --lang zh
 
 # 管理后台服务状态
 timetrack service status
@@ -115,11 +126,11 @@ timetrack service restart
 timetrack service stop
 ```
 
-### 终端输出看板样例 (`timetrack today`)
+### 终端输出看板样例 (`timetrack today --lang zh`)
 
 ```text
 ╔═══════════════════════════════════════════════════════════════╗
-║          📊 桌面时间使用简报 (2026-09-12)             ║
+║                    📊 桌面时间使用简报 (2026-09-12)                    ║
 ╚═══════════════════════════════════════════════════════════════╝
   ⚡ 专注活跃时长: 3小时25分 (82.5%)
   🔒 锁屏挂机时长: 43分钟 (17.5%)
@@ -146,27 +157,30 @@ timetrack service stop
 
 ---
 
-## ⚙️ 分类规则定制
+## ⚙️ 分类规则与语言定制
 
-分类规则存储在 `~/.config/timetracker/rules.json`。你可以自由增加、调整分类名、图标、对应应用标识或窗口标题关键词：
+分类规则存储在 `~/.config/timetracker/rules.json`。你可以自由增加、调整分类名、图标、对应应用标识、窗口标题关键词以及全局语言偏好：
 
 ```json
 {
+  "language": "auto",
   "categories": [
     {
+      "id": "development",
       "name": "编程开发",
       "icon": "💻",
       "apps": ["orca", "code", "nvim", "rustrover", "clion", "cursor"],
       "title_keywords": [".py", ".rs", ".go", ".ts", ".c", "Visual Studio Code"]
     },
     {
+      "id": "media",
       "name": "媒体娱乐",
       "icon": "🎬",
       "apps": ["bilibili", "mpv", "vlc", "spotify", "steam"],
       "title_keywords": ["YouTube", "Bilibili", "哔哩哔哩"]
     }
   ],
-  "default_category": "其他应用",
+  "default_category": "other",
   "soft_idle_threshold_seconds": 900,
   "sample_interval_seconds": 5
 }
