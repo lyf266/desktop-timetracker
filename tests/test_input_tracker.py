@@ -361,5 +361,126 @@ class TestHourlySplittingAndReporting(unittest.TestCase):
         self.assertIn("Mouse Travel", md_en)
 
 
+class TestAntiChurnDebounceAndIndexOptimization(unittest.TestCase):
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmp_dir.name) / "test_debounce.db"
+        self.db = dt.Database(db_path=self.db_path)
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    def test_transient_jitter_under_2s_discarded_when_no_input(self):
+        """Transient switch (< 2s, 0 keys, 0 clicks, unlocked, uncommitted) is dropped."""
+        daemon = dt.Daemon.__new__(dt.Daemon)
+        daemon.db = self.db
+        daemon.rules = dt.DEFAULT_RULES
+        daemon._pending_carryover_mouse_px = 0.0
+        daemon.last_flush_time = 0
+        now = datetime.datetime.now()
+        daemon.current_chunk = {
+            "start_dt": now,
+            "last_dt": now + datetime.timedelta(milliseconds=500),
+            "app_id": "temp_popup",
+            "app_name": "Temp Popup",
+            "window_title": "popup",
+            "category": "other",
+            "is_locked": 0,
+            "db_id": None,
+            "key_presses": 0,
+            "mouse_clicks": 0,
+            "mouse_distance_px": 15.0
+        }
+
+        daemon.flush_chunk(final=True)
+        self.assertIsNone(daemon.current_chunk)
+        self.assertEqual(daemon._pending_carryover_mouse_px, 15.0)
+
+        # Verify nothing was saved to DB
+        records = self.db.query_day(now.strftime("%Y-%m-%d"))
+        self.assertEqual(len(records), 0)
+
+    def test_transient_switch_preserved_if_keys_or_clicks_present(self):
+        """Even if < 2s, if user pressed keys or clicked, record MUST be preserved."""
+        daemon = dt.Daemon.__new__(dt.Daemon)
+        daemon.db = self.db
+        daemon.rules = dt.DEFAULT_RULES
+        daemon._pending_carryover_mouse_px = 0.0
+        daemon.last_flush_time = 0
+        now = datetime.datetime.now()
+        daemon.current_chunk = {
+            "start_dt": now,
+            "last_dt": now + datetime.timedelta(seconds=1),
+            "app_id": "quick_cmd",
+            "app_name": "Quick Cmd",
+            "window_title": "cmd",
+            "category": "terminal",
+            "is_locked": 0,
+            "db_id": None,
+            "key_presses": 3,
+            "mouse_clicks": 0,
+            "mouse_distance_px": 5.0
+        }
+
+        daemon.flush_chunk(final=True)
+        self.assertIsNone(daemon.current_chunk)
+
+        # Must be saved because key_presses > 0
+        records = self.db.query_day(now.strftime("%Y-%m-%d"))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["key_presses"], 3)
+        self.assertEqual(records[0]["app_name"], "Quick Cmd")
+
+    def test_sustained_chunk_persisted(self):
+        """Chunk >= 2 seconds is always saved."""
+        daemon = dt.Daemon.__new__(dt.Daemon)
+        daemon.db = self.db
+        daemon.rules = dt.DEFAULT_RULES
+        daemon._pending_carryover_mouse_px = 0.0
+        daemon.last_flush_time = 0
+        now = datetime.datetime.now()
+        daemon.current_chunk = {
+            "start_dt": now,
+            "last_dt": now + datetime.timedelta(seconds=5),
+            "app_id": "code",
+            "app_name": "VS Code",
+            "window_title": "app.py",
+            "category": "development",
+            "is_locked": 0,
+            "db_id": None,
+            "key_presses": 0,
+            "mouse_clicks": 0,
+            "mouse_distance_px": 0
+        }
+
+        daemon.flush_chunk(final=True)
+        records = self.db.query_day(now.strftime("%Y-%m-%d"))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["duration_seconds"], 5)
+
+    def test_indexed_range_query_filtering(self):
+        """Test query_day and query_date_range boundary correctness."""
+        self.db.save_record("2026-10-17 23:59:00", "2026-10-17 23:59:30", 30, "app1", "App1", "w1", "other", 0, 0)
+        self.db.save_record("2026-10-18 00:00:00", "2026-10-18 00:05:00", 300, "app2", "App2", "w2", "other", 0, 0)
+        self.db.save_record("2026-10-18 12:00:00", "2026-10-18 12:30:00", 1800, "app3", "App3", "w3", "other", 0, 0)
+        self.db.save_record("2026-10-19 00:00:00", "2026-10-19 00:01:00", 60, "app4", "App4", "w4", "other", 0, 0)
+
+        # Day query 2026-10-18 must return exactly app2 and app3
+        day_records = self.db.query_day("2026-10-18")
+        self.assertEqual(len(day_records), 2)
+        self.assertEqual(day_records[0]["app_name"], "App2")
+        self.assertEqual(day_records[1]["app_name"], "App3")
+
+        # Range query 2026-10-17 to 2026-10-18 must return app1, app2, app3
+        range_records = self.db.query_date_range("2026-10-17", "2026-10-18")
+        self.assertEqual(len(range_records), 3)
+
+    def test_checkpoint_db_execution(self):
+        daemon = dt.Daemon.__new__(dt.Daemon)
+        daemon.db = self.db
+        # Should execute without error
+        daemon.checkpoint_db()
+
+
 if __name__ == "__main__":
     unittest.main()
