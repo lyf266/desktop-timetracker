@@ -218,6 +218,13 @@ Classification rules and language preferences are stored in `~/.config/timetrack
 
 ---
 
+## 🗺️ Roadmap & Backlog
+
+See [TODO.md](TODO.md) for detailed architecture and development specs:
+- **[Backlog] Local Zero-Trace Input Activity Tracker**: Lightweight, privacy-preserving blind counter for keystrokes, mouse clicks, and distance scalars via `evdev` without storing any keycodes or stroke timings.
+
+---
+
 ## 📄 License
 
 This project is licensed under the [MIT License](LICENSE).
