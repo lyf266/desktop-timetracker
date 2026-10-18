@@ -24,6 +24,7 @@ Under the modern **Wayland** display server protocol, traditional X11-based wind
 6. **Multi-Language Support (i18n)**: Out-of-the-box support for **English** and **Simplified Chinese** across terminal outputs, category labels, and daily Markdown reports. Easily switch anytime via `timetrack lang <en|zh>`.
 7. **Automatic Daily Markdown Reports**: Automatically compiles clean, structured Markdown reports with category breakdowns, application rankings, task captions, and 24-hour activity timelines into `~/Documents/TimeReports/YYYY-MM-DD.md`.
 8. **Systemd User Service**: Managed cleanly as a `systemd --user` daemon that automatically starts and stops alongside your graphical session lifecycle.
+9. **Zero-Trace Input Activity Tracker**: Pure Python standard library monitor for hardware input devices. Enforcing strict blind counting (keycodes discarded instantly, coordinates never logged, irreversible), accurately measuring full-day and hourly keystrokes, typing speed (KPM), mouse travel (meters), and clicks with a 24-hour integrated activity matrix.
 
 ---
 
@@ -153,6 +154,8 @@ timetrack service stop
   ⚡ Active Focus Time: 3h 25m (82.5%)
   🔒 Locked / Away Time: 43m (17.5%)
   ⏳ Total Online Time: 4h 08m
+  ⌨️  Total Keystrokes: 4,520 keys (22.0 KPM)
+  🖱️  Total Mouse Travel: 142.5 m (Clicks: 1,320)
 ─────────────────────────────────────────────────────────────────
 
 📂 【Category Distribution】:
@@ -171,6 +174,14 @@ timetrack service stop
   1. [Orca IDE] desktop-timetracker - src/desktop-timetracker (1h 15m)
   2. [Firefox] ArchWiki — KDE Plasma on Wayland (35m)
   3. [Konsole] bash — systemctl status (22m)
+
+🕒 【24-Hour Activity Timeline】:
+  Time Range    Focus Time   Keystrokes   Mouse Travel   Intensity
+  ───────────── ────────   ──────────   ──────────   ─────────────────
+  09:00 - 10:00      52m       1,280 keys     35.2 m   [██████████░░░░░]
+  10:00 - 11:00      58m       2,120 keys     58.6 m   [████████████░░░]
+  11:00 - 12:00      45m         820 keys     22.1 m   [████████░░░░░░░]
+  14:00 - 15:00      50m         300 keys     26.6 m   [█████████░░░░░░]
 ```
 
 ---

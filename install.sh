@@ -38,6 +38,16 @@ if [ ${#missing_deps[@]} -gt 0 ]; then
     exit 1
 fi
 
+# 1.1 Input permissions check for keystroke and mouse travel tracking
+if id -nG "$USER" | grep -qw "input"; then
+    echo -e "  ${GREEN}✓${NC} User '$USER' belongs to 'input' group (keystroke & mouse metrics enabled)."
+else
+    echo -e "  ${YELLOW}!${NC} Notice: User '$USER' is not currently in the 'input' group."
+    echo -e "    ${YELLOW}To enable keyboard typing & mouse travel distance tracking:${NC}"
+    echo -e "      ${BLUE}sudo usermod -aG input \"$USER\"${NC}"
+    echo -e "    ${YELLOW}(Log out and log back in for changes to take effect).${NC}"
+fi
+
 # 2. Target Directories
 BIN_DIR="${HOME}/.local/bin"
 DATA_DIR="${HOME}/.local/share/timetracker"

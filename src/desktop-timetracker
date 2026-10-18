@@ -13,11 +13,15 @@ import argparse
 import datetime
 import glob
 import json
+import math
 import os
+import selectors
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -34,6 +38,28 @@ DB_FILE = DATA_DIR / "timetracker.db"
 KWIN_SCRIPT_FILE = DATA_DIR / "timetracker_kwin.js"
 SERVICE_FILE = SYSTEMD_USER_DIR / "desktop-timetracker.service"
 
+# --- Hardware Input Constants ---
+EVENT_FORMAT = "qqHHi" if struct.calcsize("P") == 8 else "llHHi"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+PX_TO_METERS = 0.0254 / 96.0  # Standard 96 DPI: 1 inch = 0.0254m = 96px => 1px ≈ 0.2646 mm
+
+
+def px_to_meters(px):
+    return px * PX_TO_METERS
+
+
+def format_distance(distance_px, lang="en"):
+    meters = px_to_meters(distance_px)
+    if meters >= 1000:
+        km = meters / 1000.0
+        return f"{km:.2f} km"
+    elif meters >= 1:
+        return f"{meters:.1f} m"
+    else:
+        cm = meters * 100.0
+        return f"{cm:.1f} cm"
+
+
 # --- i18n Localization Dictionaries ---
 I18N = {
     "en": {
@@ -41,6 +67,18 @@ I18N = {
         "active_time": "Active Focus Time",
         "locked_time": "Locked / Away Time",
         "total_time": "Total Online Time",
+        "total_keys": "Total Keystrokes",
+        "total_mouse": "Total Mouse Travel",
+        "unit_times": "keys",
+        "unit_short": "keys",
+        "kpm_unit": "KPM",
+        "mouse_clicks_label": "Clicks",
+        "hourly_dist": "24-Hour Activity Timeline",
+        "col_period": "Time Range",
+        "col_focus": "Focus Time",
+        "col_keys": "Keystrokes",
+        "col_mouse": "Mouse Travel",
+        "col_intensity": "Intensity",
         "category_dist": "Category Distribution",
         "top_apps": "Top Applications",
         "key_tasks": "Key Window Tasks",
@@ -73,6 +111,8 @@ I18N = {
         "md_total_uptime": "Total Uptime",
         "md_active_focus": "Active Focus Time",
         "md_locked_away": "Locked / Away Time",
+        "md_total_keys": "Total Keystrokes",
+        "md_total_mouse": "Total Mouse Travel",
         "md_cat_table_title": "## 2. Category Time Distribution",
         "md_col_cat": "Category",
         "md_col_dur": "Duration",
@@ -86,6 +126,8 @@ I18N = {
         "md_col_details": "Window Title Details",
         "md_hourly_title": "## 5. 24-Hour Activity Timeline",
         "md_col_period": "Time Range",
+        "md_col_keys": "Keystrokes",
+        "md_col_mouse": "Mouse Travel",
         "md_col_viz": "Activity Visualization",
         "md_footer": "*Automatically recorded by Desktop TimeTracker*",
         "md_no_records": "No activity records found for this date.",
@@ -95,6 +137,18 @@ I18N = {
         "active_time": "专注活跃时长",
         "locked_time": "锁屏挂机时长",
         "total_time": "累计在线时间",
+        "total_keys": "全天键盘打字",
+        "total_mouse": "全天鼠标活动",
+        "unit_times": "次",
+        "unit_short": "次",
+        "kpm_unit": "键/分",
+        "mouse_clicks_label": "点击",
+        "hourly_dist": "24小时活跃时段分布",
+        "col_period": "时段",
+        "col_focus": "专注时长",
+        "col_keys": "打字量",
+        "col_mouse": "鼠标滑行",
+        "col_intensity": "强度",
         "category_dist": "类别分布",
         "top_apps": "Top 应用排行",
         "key_tasks": "关键任务详情",
@@ -127,6 +181,8 @@ I18N = {
         "md_total_uptime": "总开机时长",
         "md_active_focus": "有效专注时长",
         "md_locked_away": "锁屏/离开时长",
+        "md_total_keys": "全天键盘打字",
+        "md_total_mouse": "全天鼠标活动",
         "md_cat_table_title": "## 2. 类别时间分布",
         "md_col_cat": "分类",
         "md_col_dur": "累计时长",
@@ -140,6 +196,8 @@ I18N = {
         "md_col_details": "窗口标题明细",
         "md_hourly_title": "5. 全天活跃时段分布 (小时)",
         "md_col_period": "时段",
+        "md_col_keys": "打字量",
+        "md_col_mouse": "鼠标滑行",
         "md_col_viz": "活跃度可视化",
         "md_footer": "*由 Desktop TimeTracker 自动记录生成*",
         "md_no_records": "该日期无活动记录。",
@@ -489,6 +547,225 @@ class XDGDesktopIndex:
         return None
 
 
+class InputActivityMonitor:
+    """Zero-dependency, privacy-first background hardware input monitor.
+
+    Strict Invariants:
+    1. Blind key counter: When ev_type == EV_KEY and val == 1 on a keyboard,
+       immediately increment key_presses += 1. The keycode is NEVER stored,
+       logged, or mapped in memory.
+    2. Motion scalar: Mouse dx/dy are accumulated as Euclidean distance scalars only.
+       Screen coordinates (x, y) are never tracked.
+    3. 100% local, thread-safe, gracefully handles missing /dev/input permissions.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._key_presses = 0
+        self._mouse_clicks = 0
+        self._mouse_distance_px = 0.0
+
+        # Mouse relative delta buffer per-device fd
+        self._mouse_dx = {}
+        self._mouse_dy = {}
+
+        self.running = False
+        self.thread = None
+        self.has_permission = True
+        self._warned_permission = False
+        self._fds = {}  # fd: (dev_type, node)
+        self._selector = None
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._worker, name="InputActivityMonitor", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self._selector:
+            try:
+                self._selector.close()
+            except Exception:
+                pass
+        for fd in list(self._fds.keys()):
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        self._fds.clear()
+
+    def get_and_reset(self):
+        with self.lock:
+            for fd in list(self._mouse_dx.keys()):
+                dx = self._mouse_dx.get(fd, 0)
+                dy = self._mouse_dy.get(fd, 0)
+                if dx != 0 or dy != 0:
+                    self._mouse_distance_px += math.hypot(dx, dy)
+                    self._mouse_dx[fd] = 0
+                    self._mouse_dy[fd] = 0
+
+            keys = self._key_presses
+            clicks = self._mouse_clicks
+            dist = int(round(self._mouse_distance_px))
+            self._key_presses = 0
+            self._mouse_clicks = 0
+            self._mouse_distance_px = 0.0
+            return keys, clicks, dist
+
+    @staticmethod
+    def scan_devices():
+        keyboards = []
+        mice = []
+        devices_file = Path("/proc/bus/input/devices")
+        if not devices_file.exists():
+            return keyboards, mice
+
+        try:
+            with open(devices_file, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            return keyboards, mice
+
+        blocks = content.strip().split("\n\n")
+        for b in blocks:
+            lines = b.splitlines()
+            name = ""
+            handlers = []
+            for line in lines:
+                if line.startswith("N: Name="):
+                    name = line.split("=", 1)[1].strip('"')
+                elif line.startswith("H: Handlers="):
+                    handlers = line.split("=", 1)[1].strip().split()
+
+            event_node = None
+            for h in handlers:
+                if h.startswith("event"):
+                    event_node = f"/dev/input/{h}"
+                    break
+            if not event_node:
+                continue
+
+            lower_name = name.lower()
+            if any(ign in lower_name for ign in ["power button", "sleep button", "lid switch", "video bus", "speaker"]):
+                continue
+
+            is_mouse = "mouse" in handlers or any("mouse" in h for h in handlers) or "touchpad" in lower_name
+            is_kbd = "kbd" in handlers and not is_mouse
+
+            if is_kbd:
+                keyboards.append((name, event_node))
+            elif is_mouse:
+                mice.append((name, event_node))
+
+        return keyboards, mice
+
+    def _init_devices(self):
+        if not self._selector:
+            self._selector = selectors.DefaultSelector()
+
+        keyboards, mice = self.scan_devices()
+        all_devs = [(name, node, "kbd") for name, node in keyboards] + [(name, node, "mouse") for name, node in mice]
+
+        permission_err = False
+        opened_any = False
+        current_nodes = {dev_info[1] for dev_info in self._fds.values()}
+
+        for name, node, dev_type in all_devs:
+            if node in current_nodes:
+                continue
+            try:
+                fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+                self._selector.register(fd, selectors.EVENT_READ)
+                self._fds[fd] = (dev_type, node)
+                self._mouse_dx[fd] = 0
+                self._mouse_dy[fd] = 0
+                opened_any = True
+            except PermissionError:
+                permission_err = True
+            except Exception:
+                pass
+
+        if permission_err and not opened_any:
+            self.has_permission = False
+            if not self._warned_permission:
+                self._warned_permission = True
+                print(f"[{datetime.datetime.now()}] ⚠️ [Notice] /dev/input read access needed for keyboard/mouse activity metrics.")
+                print(f"[{datetime.datetime.now()}] To enable: sudo usermod -aG input $USER (then re-login). Continuing tracking window duration.")
+        elif opened_any:
+            self.has_permission = True
+            if self._warned_permission:
+                print(f"[{datetime.datetime.now()}] ✅ /dev/input opened successfully. Keyboard & mouse activity tracking is active.")
+                self._warned_permission = False
+
+    def _worker(self):
+        last_scan_time = 0
+        while self.running:
+            now = time.time()
+            if now - last_scan_time > 30:
+                last_scan_time = now
+                self._init_devices()
+
+            if not self._fds:
+                time.sleep(2.0)
+                continue
+
+            try:
+                events = self._selector.select(timeout=1.0)
+            except Exception:
+                break
+
+            for key, mask in events:
+                fd = key.fd
+                dev_type, node = self._fds.get(fd, ("unknown", ""))
+                try:
+                    data = os.read(fd, EVENT_SIZE * 64)
+                except (BlockingIOError, InterruptedError):
+                    continue
+                except Exception:
+                    try:
+                        self._selector.unregister(fd)
+                        os.close(fd)
+                    except Exception:
+                        pass
+                    self._fds.pop(fd, None)
+                    continue
+
+                if not data:
+                    continue
+
+                num_events = len(data) // EVENT_SIZE
+                for i in range(num_events):
+                    chunk = data[i * EVENT_SIZE:(i + 1) * EVENT_SIZE]
+                    sec, usec, ev_type, code, val = struct.unpack(EVENT_FORMAT, chunk)
+
+                    if dev_type == "kbd":
+                        # Absolute blind counter: count press (val == 1), immediately discard keycode
+                        if ev_type == 1 and val == 1:
+                            with self.lock:
+                                self._key_presses += 1
+                    elif dev_type == "mouse":
+                        if ev_type == 2:  # EV_REL
+                            if code == 0:  # REL_X
+                                self._mouse_dx[fd] = self._mouse_dx.get(fd, 0) + val
+                            elif code == 1:  # REL_Y
+                                self._mouse_dy[fd] = self._mouse_dy.get(fd, 0) + val
+                        elif ev_type == 0:  # EV_SYN
+                            dx = self._mouse_dx.get(fd, 0)
+                            dy = self._mouse_dy.get(fd, 0)
+                            if dx != 0 or dy != 0:
+                                dist = math.hypot(dx, dy)
+                                with self.lock:
+                                    self._mouse_distance_px += dist
+                                self._mouse_dx[fd] = 0
+                                self._mouse_dy[fd] = 0
+                        elif ev_type == 1 and val == 1:  # EV_KEY (button press)
+                            with self.lock:
+                                self._mouse_clicks += 1
+
+
 class Database:
     def __init__(self, db_path=DB_FILE):
         self.db_path = db_path
@@ -503,63 +780,92 @@ class Database:
 
     def _init_db(self):
         ensure_dirs()
-        with self.get_conn() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS window_activities (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    start_time TEXT NOT NULL,
-                    end_time TEXT NOT NULL,
-                    duration_seconds INTEGER NOT NULL,
-                    app_id TEXT NOT NULL,
-                    app_name TEXT NOT NULL,
-                    window_title TEXT NOT NULL,
-                    category TEXT NOT NULL,
-                    is_locked INTEGER DEFAULT 0,
-                    is_idle INTEGER DEFAULT 0
-                );
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_time ON window_activities(start_time, end_time);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_category ON window_activities(category);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_app ON window_activities(app_id);")
+        conn = self.get_conn()
+        try:
+            with conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS window_activities (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        start_time TEXT NOT NULL,
+                        end_time TEXT NOT NULL,
+                        duration_seconds INTEGER NOT NULL,
+                        app_id TEXT NOT NULL,
+                        app_name TEXT NOT NULL,
+                        window_title TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        is_locked INTEGER DEFAULT 0,
+                        is_idle INTEGER DEFAULT 0,
+                        key_presses INTEGER DEFAULT 0,
+                        mouse_clicks INTEGER DEFAULT 0,
+                        mouse_distance_px INTEGER DEFAULT 0
+                    );
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_time ON window_activities(start_time, end_time);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_category ON window_activities(category);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_app ON window_activities(app_id);")
 
-    def save_record(self, start_time, end_time, duration, app_id, app_name, window_title, category, is_locked, is_idle, record_id=None):
+                # Backward-compatibility schema migration
+                cur = conn.execute("PRAGMA table_info(window_activities);")
+                cols = [r["name"] for r in cur.fetchall()]
+                if "key_presses" not in cols:
+                    conn.execute("ALTER TABLE window_activities ADD COLUMN key_presses INTEGER DEFAULT 0;")
+                if "mouse_clicks" not in cols:
+                    conn.execute("ALTER TABLE window_activities ADD COLUMN mouse_clicks INTEGER DEFAULT 0;")
+                if "mouse_distance_px" not in cols:
+                    conn.execute("ALTER TABLE window_activities ADD COLUMN mouse_distance_px INTEGER DEFAULT 0;")
+        finally:
+            conn.close()
+
+    def save_record(self, start_time, end_time, duration, app_id, app_name, window_title, category, is_locked, is_idle, key_presses=0, mouse_clicks=0, mouse_distance_px=0, record_id=None):
         if duration <= 0:
             return None
-        with self.get_conn() as conn:
-            if record_id:
-                conn.execute("""
-                    UPDATE window_activities
-                    SET end_time = ?, duration_seconds = ?, is_idle = ?
-                    WHERE id = ?
-                """, (end_time, duration, is_idle, record_id))
-                return record_id
-            else:
-                cur = conn.execute("""
-                    INSERT INTO window_activities (
-                        start_time, end_time, duration_seconds,
-                        app_id, app_name, window_title, category,
-                        is_locked, is_idle
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (start_time, end_time, duration, app_id, app_name, window_title, category, is_locked, is_idle))
-                return cur.lastrowid
+        conn = self.get_conn()
+        try:
+            with conn:
+                if record_id:
+                    conn.execute("""
+                        UPDATE window_activities
+                        SET end_time = ?, duration_seconds = ?, is_idle = ?,
+                            key_presses = ?, mouse_clicks = ?, mouse_distance_px = ?
+                        WHERE id = ?
+                    """, (end_time, duration, is_idle, key_presses, mouse_clicks, mouse_distance_px, record_id))
+                    return record_id
+                else:
+                    cur = conn.execute("""
+                        INSERT INTO window_activities (
+                            start_time, end_time, duration_seconds,
+                            app_id, app_name, window_title, category,
+                            is_locked, is_idle,
+                            key_presses, mouse_clicks, mouse_distance_px
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (start_time, end_time, duration, app_id, app_name, window_title, category, is_locked, is_idle, key_presses, mouse_clicks, mouse_distance_px))
+                    return cur.lastrowid
+        finally:
+            conn.close()
 
     def query_day(self, target_date):
-        with self.get_conn() as conn:
+        conn = self.get_conn()
+        try:
             cur = conn.execute("""
                 SELECT * FROM window_activities
                 WHERE date(start_time) = date(?)
                 ORDER BY start_time ASC
             """, (target_date,))
             return [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
 
     def query_date_range(self, start_date, end_date):
-        with self.get_conn() as conn:
+        conn = self.get_conn()
+        try:
             cur = conn.execute("""
                 SELECT * FROM window_activities
                 WHERE date(start_time) >= date(?) AND date(start_time) <= date(?)
                 ORDER BY start_time ASC
             """, (start_date, end_date))
             return [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
 
 
 class Classifier:
@@ -649,10 +955,15 @@ class ReportGenerator:
 
         total_active_secs = 0
         total_locked_secs = 0
+        total_keys = 0
+        total_clicks = 0
+        total_mouse_px = 0
         cat_times = {}
         app_times = {}
         window_times = {}
         hourly_active = {h: 0 for h in range(24)}
+        hourly_keys = {h: 0 for h in range(24)}
+        hourly_mouse = {h: 0 for h in range(24)}
 
         for r in records:
             dur = r["duration_seconds"]
@@ -665,6 +976,13 @@ class ReportGenerator:
                 total_locked_secs += dur
             else:
                 total_active_secs += dur
+                kp = r.get("key_presses") or 0
+                mc = r.get("mouse_clicks") or 0
+                mdist = r.get("mouse_distance_px") or 0
+                total_keys += kp
+                total_clicks += mc
+                total_mouse_px += mdist
+
                 cat_display, _ = get_category_display(cat_raw, lang)
                 cat_times[cat_display] = cat_times.get(cat_display, 0) + dur
                 app_times[app] = app_times.get(app, 0) + dur
@@ -672,11 +990,16 @@ class ReportGenerator:
 
                 try:
                     start_dt = datetime.datetime.fromisoformat(r["start_time"])
-                    hourly_active[start_dt.hour] += dur
+                    h = start_dt.hour
+                    hourly_active[h] += dur
+                    hourly_keys[h] += kp
+                    hourly_mouse[h] += mdist
                 except Exception:
                     pass
 
         grand_total = total_active_secs + total_locked_secs
+        active_mins = total_active_secs / 60.0
+        kpm = (total_keys / active_mins) if active_mins > 0 else 0.0
 
         sorted_cats = sorted(cat_times.items(), key=lambda x: x[1], reverse=True)
         sorted_apps = sorted(app_times.items(), key=lambda x: x[1], reverse=True)[:10]
@@ -693,6 +1016,8 @@ class ReportGenerator:
         md.append(f"- **{t['md_total_uptime']}**: `{format_duration(grand_total, lang)}`")
         md.append(f"- **{t['md_active_focus']}**: `{format_duration(total_active_secs, lang)}` ({pct_active:.1f}%)")
         md.append(f"- **{t['md_locked_away']}**: `{format_duration(total_locked_secs, lang)}` ({pct_locked:.1f}%)")
+        md.append(f"- **{t['md_total_keys']}**: `{total_keys:,} {t['unit_short']}` ({kpm:.1f} {t['kpm_unit']})")
+        md.append(f"- **{t['md_total_mouse']}**: `{format_distance(total_mouse_px, lang)}` ({t['mouse_clicks_label']}: {total_clicks:,})")
 
         # Category Table
         md.append(f"\n{t['md_cat_table_title']}\n")
@@ -723,14 +1048,18 @@ class ReportGenerator:
 
         # Hourly Activity Chart
         md.append(f"\n{t['md_hourly_title']}\n")
-        md.append(f"| {t['md_col_period']} | {t['md_col_dur']} | {t['md_col_viz']} |")
-        md.append("| :---: | :--- | :--- |")
+        md.append(f"| {t['md_col_period']} | {t['col_focus']} | {t['md_col_keys']} | {t['md_col_mouse']} | {t['md_col_viz']} |")
+        md.append("| :---: | :--- | :--- | :--- | :--- |")
         for h in range(24):
             secs = hourly_active[h]
-            if secs > 0:
+            keys = hourly_keys[h]
+            m_px = hourly_mouse[h]
+            if secs > 0 or keys > 0 or m_px > 0:
                 ratio = min(secs / 3600.0, 1.0)
                 bar = make_bar(ratio, width=12)
-                md.append(f"| `{h:02d}:00 - {h+1:02d}:00` | `{format_duration_short(secs)}` | `{bar}` |")
+                keys_str = f"{keys:,} {t['unit_short']}"
+                dist_str = format_distance(m_px, lang)
+                md.append(f"| `{h:02d}:00 - {h+1:02d}:00` | `{format_duration_short(secs)}` | `{keys_str}` | `{dist_str}` | `{bar}` |")
 
         md.append(f"\n---\n{t['md_footer']}\n")
         return "\n".join(md)
@@ -746,6 +1075,8 @@ class Daemon:
         self.last_flush_time = time.time()
         self.kwin_script_id = None
         self.journal_proc = None
+        self.input_monitor = InputActivityMonitor()
+        self.input_monitor.start()
 
     def get_lock_status(self):
         try:
@@ -802,6 +1133,9 @@ class Daemon:
             category=c["category"],
             is_locked=c["is_locked"],
             is_idle=is_idle,
+            key_presses=c.get("key_presses", 0),
+            mouse_clicks=c.get("mouse_clicks", 0),
+            mouse_distance_px=c.get("mouse_distance_px", 0),
             record_id=c.get("db_id")
         )
         c["db_id"] = rec_id
@@ -817,6 +1151,12 @@ class Daemon:
                 print(f"[{datetime.datetime.now()}] Date rollover detected ({chunk_date} -> {current_date_str}). Exporting report.")
                 self.flush_chunk(final=True)
                 self.export_report(chunk_date)
+
+    def check_hourly_rollover(self, now):
+        if self.current_chunk:
+            chunk_dt = self.current_chunk["start_dt"]
+            if chunk_dt.hour != now.hour or chunk_dt.date() != now.date():
+                self.flush_chunk(final=True)
 
     def export_report(self, date_str):
         try:
@@ -835,6 +1175,20 @@ class Daemon:
         now = datetime.datetime.now()
         today_str = now.strftime("%Y-%m-%d")
         self.check_daily_rollover(today_str)
+        self.check_hourly_rollover(now)
+
+        delta_keys, delta_clicks, delta_dist = self.input_monitor.get_and_reset()
+        if self.current_chunk:
+            self.current_chunk["key_presses"] = self.current_chunk.get("key_presses", 0) + delta_keys
+            self.current_chunk["mouse_clicks"] = self.current_chunk.get("mouse_clicks", 0) + delta_clicks
+            self.current_chunk["mouse_distance_px"] = self.current_chunk.get("mouse_distance_px", 0) + delta_dist
+            pending_keys = 0
+            pending_clicks = 0
+            pending_dist = 0
+        else:
+            pending_keys = delta_keys
+            pending_clicks = delta_clicks
+            pending_dist = delta_dist
 
         is_locked = self.get_lock_status()
         lang = get_language()
@@ -891,7 +1245,10 @@ class Daemon:
             "window_title": window_title,
             "category": category_key,
             "is_locked": 1 if is_locked else 0,
-            "db_id": None
+            "db_id": None,
+            "key_presses": pending_keys,
+            "mouse_clicks": pending_clicks,
+            "mouse_distance_px": pending_dist
         }
         self.flush_chunk(final=False)
 
@@ -934,6 +1291,7 @@ class Daemon:
 
         finally:
             print(f"[{datetime.datetime.now()}] Finalizing database and unloading script...")
+            self.input_monitor.stop()
             self.flush_chunk(final=True)
             if self.journal_proc:
                 self.journal_proc.terminate()
@@ -958,10 +1316,20 @@ def cmd_today(args):
     total_locked = sum(r["duration_seconds"] for r in records if r["is_locked"])
     grand_total = total_active + total_locked
 
+    total_keys = sum((r.get("key_presses") or 0) for r in records if not r["is_locked"])
+    total_clicks = sum((r.get("mouse_clicks") or 0) for r in records if not r["is_locked"])
+    total_mouse_px = sum((r.get("mouse_distance_px") or 0) for r in records if not r["is_locked"])
+
+    active_mins = total_active / 60.0
+    kpm = (total_keys / active_mins) if active_mins > 0 else 0.0
+
     cat_times = {}
     cat_icons = {}
     app_times = {}
     win_times = {}
+    hourly_active = {h: 0 for h in range(24)}
+    hourly_keys = {h: 0 for h in range(24)}
+    hourly_mouse = {h: 0 for h in range(24)}
 
     for r in records:
         dur = r["duration_seconds"]
@@ -976,6 +1344,17 @@ def cmd_today(args):
             app_times[app] = app_times.get(app, 0) + dur
             win_times[(app, title)] = win_times.get((app, title), 0) + dur
 
+            kp = r.get("key_presses") or 0
+            mdist = r.get("mouse_distance_px") or 0
+            try:
+                start_dt = datetime.datetime.fromisoformat(r["start_time"])
+                h = start_dt.hour
+                hourly_active[h] += dur
+                hourly_keys[h] += kp
+                hourly_mouse[h] += mdist
+            except Exception:
+                pass
+
     title_box = f"📊 {t['title_today'].format(date=target_date)}"
     box_len = max(63, len(title_box) + 12)
     border = "═" * box_len
@@ -988,6 +1367,8 @@ def cmd_today(args):
     print(f"  ⚡ {t['active_time']}: \033[1;32m{format_duration(total_active, lang)}\033[0m ({pct_active:.1f}%)")
     print(f"  🔒 {t['locked_time']}: \033[1;33m{format_duration(total_locked, lang)}\033[0m ({pct_locked:.1f}%)")
     print(f"  ⏳ {t['total_time']}: {format_duration(grand_total, lang)}")
+    print(f"  ⌨️  {t['total_keys']}: \033[1;36m{total_keys:,}\033[0m {t['unit_times']} (\033[36m{kpm:.1f} {t['kpm_unit']}\033[0m)")
+    print(f"  🖱️  {t['total_mouse']}: \033[1;35m{format_distance(total_mouse_px, lang)}\033[0m ({t['mouse_clicks_label']}: {total_clicks:,})")
     print(f"─────────────────────────────────────────────────────────────────")
 
     print(f"\n📂 【{t['category_dist']}】:")
@@ -1008,6 +1389,25 @@ def cmd_today(args):
     for idx, ((app, title), secs) in enumerate(sorted(win_times.items(), key=lambda x: x[1], reverse=True)[:5], 1):
         clean_title = title if len(title) <= 45 else title[:42] + "..."
         print(f"  {idx}. [{app}] {clean_title} ({format_duration(secs, lang)})")
+
+    # 24-Hour Integrated Matrix
+    active_hours = [h for h in range(24) if hourly_active[h] > 0 or hourly_keys[h] > 0 or hourly_mouse[h] > 0]
+    if active_hours:
+        print(f"\n🕒 【{t['hourly_dist']}】:")
+        print(f"  {t['col_period'].ljust(13)} {t['col_focus'].rjust(8)}   {t['col_keys'].rjust(10)}   {t['col_mouse'].rjust(10)}   {t['col_intensity']}")
+        print(f"  {'─'*13} {'─'*8}   {'─'*10}   {'─'*10}   {'─'*17}")
+        for h in range(24):
+            secs = hourly_active[h]
+            keys = hourly_keys[h]
+            m_px = hourly_mouse[h]
+            if secs > 0 or keys > 0 or m_px > 0:
+                ratio = min(secs / 3600.0, 1.0)
+                bar = make_bar(ratio, width=15)
+                period_str = f"{h:02d}:00 - {h+1:02d}:00"
+                dur_str = format_duration_short(secs).rjust(8)
+                keys_str = f"{keys:,} {t['unit_short']}".rjust(10)
+                dist_str = format_distance(m_px, lang).rjust(10)
+                print(f"  {period_str} {dur_str}   \033[1;36m{keys_str}\033[0m   \033[1;35m{dist_str}\033[0m   [{bar}]")
     print("")
 
 
@@ -1091,7 +1491,8 @@ def cmd_status(args):
     print(f"\n{t['service_status']}: {color}{state.upper()}\033[0m")
 
     db = Database()
-    with db.get_conn() as conn:
+    conn = db.get_conn()
+    try:
         cur = conn.execute("SELECT * FROM window_activities ORDER BY id DESC LIMIT 1;")
         row = cur.fetchone()
         if row:
@@ -1102,6 +1503,8 @@ def cmd_status(args):
             print(f"{t['current_duration']}: {format_duration(row['duration_seconds'], lang)}\n")
         else:
             print(f"{t['no_records_db']}\n")
+    finally:
+        conn.close()
 
 
 def cmd_lang(args):

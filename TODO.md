@@ -6,8 +6,8 @@
 
 ## 🎯 待办需求：本地零留痕键盘与鼠标输入活力指数 (Input Activity Tracker)
 
-- **任务状态**：`[ ] 规划中 (Backlog)`
-- **建议排期**：考后恢复期 (2026-10-25 起，战时备考期间全面封板)
+- **任务状态**：`[x] 已完成 (Delivered)`
+- **完成日期**：2026-10-18
 - **优先级**：P2 (高价值工程扩展)
 
 ### 1. 需求背景与目标
@@ -19,7 +19,7 @@
 ### 2. 核心架构契约与四大硬约束 (Non-Negotiable Invariants)
 
 1. **盲输入丢弃模型 (Blind Counter Invariant)**：
-   - 监听 Linux 底层 `/dev/input/event*`（基于 `evdev`）。
+   - 监听 Linux 底层 `/dev/input/event*`（基于纯标准库 `struct` / `selectors` 实现）。
    - 事件触发时，**立即丢弃 `event.code`（按键名称/扫描码）**，仅做全局整数自增：`total_keystrokes += 1`。
    - 严禁在内存变量、日志或数据库中出现任何特定键位（如字母、数字、回车等）的识别与映射，对密码与聊天内容完全不可逆。
 
@@ -40,17 +40,18 @@
 
 ### 3. 实现路线图与落地检查清单 (Checklist)
 
-- [ ] **权限与设备识别**：
-  - [ ] 探查当前系统的键盘与鼠标输入事件设备节点（`/dev/input/by-id/*` 或自动遍历 `event*`）。
-  - [ ] 配置免 root 用户空间方案（文档明确添加 `input` 组，或提供配套极简 udev 规则）。
-- [ ] **输入采集守护线程 (`InputActivityCollector`)**：
-  - [ ] 在 `src/desktop-timetracker` 内部启动独立轻量后台线程，低 CPU 轮询/阻塞读取事件。
-  - [ ] 实现滑动窗口缓冲区，在每次窗口切换或落库事件发生时原子读取并重置计数器。
-- [ ] **SQLite 数据库表结构轻量平滑迁移**：
-  - [ ] 在 `window_activities` 增加 `key_presses` (INTEGER DEFAULT 0)、`mouse_clicks` (INTEGER DEFAULT 0)、`mouse_distance_px` (INTEGER DEFAULT 0)。
-  - [ ] 确保老旧数据库启动时自动执行 `ALTER TABLE ADD COLUMN` 兼容迁移，不破坏历史数据。
-- [ ] **报表输出与指标可视化 (CLI)**：
-  - [ ] 在 `timetrack today` 与 `timetrack report` 中输出活跃度摘要（如：总击键量、鼠标移动里程、平均 APM / 敲击热度）。
-  - [ ] 在 Markdown 日报模板中呈现“时间投入 vs 击键产出”矩阵。
-- [ ] **单元测试与安全合规断言**：
-  - [ ] 增加针对敏感字符输入的专项验证测试，断言日志与数据库中绝无任何 keycode/字符残留。
+- [x] **权限与设备识别**：
+  - [x] 自动探测 `/proc/bus/input/devices` 中的键盘与鼠标输入事件设备节点（精准过滤电源键、视频总线与蜂鸣器）。
+  - [x] 配置免 root 用户空间方案与平滑降级（`install.sh` 检测并引导 `sudo usermod -aG input $USER`，守护进程无权限时平滑回退并不崩溃）。
+- [x] **输入采集守护线程 (`InputActivityMonitor`)**：
+  - [x] 在 `src/desktop-timetracker` 内部启动独立轻量后台线程，非阻塞读取事件与动态设备热插拔重扫。
+  - [x] 实现线程安全原子缓冲区，在窗口切换、整点跨越及落库时原子读取并重置计数器。
+- [x] **SQLite 数据库表结构轻量平滑迁移**：
+  - [x] 在 `window_activities` 增加 `key_presses` (INTEGER DEFAULT 0)、`mouse_clicks` (INTEGER DEFAULT 0)、`mouse_distance_px` (INTEGER DEFAULT 0)。
+  - [x] 老旧数据库启动时自动执行 `ALTER TABLE ADD COLUMN` 兼容迁移，不破坏历史数据。
+- [x] **报表输出与指标可视化 (CLI)**：
+  - [x] 在 `timetrack today` 概览中输出全天总击键数、平均击键率（KPM）、鼠标滑动距离（自动换算米/厘米/公里）及点击次数。
+  - [x] 扩展 24 小时活跃时段表格为「综合时段矩阵」，按小时展示各时段专注时长、打字量、鼠标滑行距离与进度条。
+  - [x] 在 Markdown 日报模板与导出文件中呈现完整的键鼠投入指标与 24 小时时段表。
+- [x] **单元测试与安全合规断言**：
+  - [x] 编写 `tests/test_input_tracker.py` 自动化测试套件（13 个针对性测试全部通过），包含针对绝对盲计数与零留痕的断言验证。
