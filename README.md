@@ -1,5 +1,10 @@
 # Desktop TimeTracker (`timetrack`)
 
+> [!WARNING]
+> **Repository Archived**
+> 
+> This project is no longer maintained. Its Wayland tracking core has moved to [lyf266/Afterimage](https://github.com/lyf266/Afterimage), which adds AI analysis and retrospective outputs. This repository remains public for reference, but will not receive further updates.
+
 > 🌐 **Language / 语言**: English | [<u><font color="#0969da">简体中文</font></u>](README_zh.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)

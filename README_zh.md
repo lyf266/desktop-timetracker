@@ -1,5 +1,10 @@
 # Desktop TimeTracker (`timetrack`)
 
+> [!WARNING]
+> **项目已归档 (Archived)**
+> 
+> 本项目停止维护。原有的 Wayland 底层追踪功能已并入新项目 [lyf266/Afterimage](https://github.com/lyf266/Afterimage)，并在其基础上增加了 AI 行为分析与工作复盘输出。本仓库保留供参考，不再接收新功能更新或 PR。
+
 > 🌐 **语言 / Language**: [<u><font color="#0969da">English</font></u>](README.md) | 简体中文
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
